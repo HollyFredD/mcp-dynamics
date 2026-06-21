@@ -121,6 +121,28 @@ export async function getEntityMetadata(
   return res.data;
 }
 
+export async function getCurrentUser(): Promise<{ UserId: string; BusinessUnitId: string; OrganizationId: string }> {
+  const api = await getClient();
+  const res = await api.get<{ UserId: string; BusinessUnitId: string; OrganizationId: string }>("/WhoAmI");
+  return res.data;
+}
+
+export async function resolveUserGuid(email?: string): Promise<string> {
+  if (!email) {
+    const me = await getCurrentUser();
+    return me.UserId;
+  }
+  const result = await queryRecords({
+    entity: "systemusers",
+    filter: `internalemailaddress eq '${email}'`,
+    select: ["systemuserid"],
+    top: 1,
+  });
+  const user = result.value[0];
+  if (!user) throw new Error(`Utilisateur introuvable avec l'email : ${email}`);
+  return user["systemuserid"] as string;
+}
+
 export async function listEntities(): Promise<{ logicalName: string; displayName: string }[]> {
   const api = await getClient();
   const res = await api.get<{

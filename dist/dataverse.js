@@ -81,6 +81,27 @@ export async function getEntityMetadata(entity) {
     const res = await api.get(`/EntityDefinitions(LogicalName='${entity}')?$select=LogicalName,DisplayName,PrimaryIdAttribute,PrimaryNameAttribute`);
     return res.data;
 }
+export async function getCurrentUser() {
+    const api = await getClient();
+    const res = await api.get("/WhoAmI");
+    return res.data;
+}
+export async function resolveUserGuid(email) {
+    if (!email) {
+        const me = await getCurrentUser();
+        return me.UserId;
+    }
+    const result = await queryRecords({
+        entity: "systemusers",
+        filter: `internalemailaddress eq '${email}'`,
+        select: ["systemuserid"],
+        top: 1,
+    });
+    const user = result.value[0];
+    if (!user)
+        throw new Error(`Utilisateur introuvable avec l'email : ${email}`);
+    return user["systemuserid"];
+}
 export async function listEntities() {
     const api = await getClient();
     const res = await api.get("/EntityDefinitions?$select=LogicalName,DisplayCollectionName&$filter=IsCustomizable/Value eq true or IsIntersect eq false");
