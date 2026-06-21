@@ -352,6 +352,155 @@ export const recordTools = [
       required: ["note"],
     },
   },
+  {
+    name: "get_forecast_summary",
+    description:
+      "Get an aggregated forecast summary for a specialist by quarter: total ACV and deal count per forecast category (committed, best_case, upside, pipeline), broken down by business unit. Primary tool to prepare for weekly forecast calls.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        close_quarter: {
+          type: "string",
+          description: "Quarter to summarize, e.g. '26-Q2' or '26-Q3'",
+        },
+        email: {
+          type: "string",
+          description: "Specialist email (defaults to authenticated user)",
+        },
+        business_units: {
+          type: "array",
+          items: { type: "string" },
+          description: "Filter by BU names, e.g. ['Security', 'Risk']. Returns all BUs if omitted.",
+        },
+      },
+      required: ["close_quarter"],
+    },
+  },
+  {
+    name: "update_opportunity_forecast",
+    description:
+      "Update the forecast category, close date, or close quarter on an opportunity. Use during pipeline reviews to move deals between categories or push out close dates. Accepts either the opportunity GUID or its number (e.g. 'OPTY5331870').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        opportunity_id: {
+          type: "string",
+          description: "GUID of the opportunity (use this or opportunity_number)",
+        },
+        opportunity_number: {
+          type: "string",
+          description: "Opportunity number like 'OPTY5331870' (use this or opportunity_id)",
+        },
+        forecast_category: {
+          type: "string",
+          enum: ["pipeline", "best_case", "committed", "upside"],
+          description: "New forecast category",
+        },
+        close_date: {
+          type: "string",
+          description: "New close date in YYYY-MM-DD format",
+        },
+        close_quarter: {
+          type: "string",
+          description: "New close quarter, e.g. '26-Q3'",
+        },
+      },
+    },
+  },
+  {
+    name: "update_specialist_forecast",
+    description:
+      "Update the forecast category on a specialist forecast record (sn_specialistforecast). Finds the record by opportunity and optionally by business unit. Use to change your committed/best_case/upside/pipeline classification at the specialist level, independently from the opportunity-level forecast.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        opportunity_id: {
+          type: "string",
+          description: "GUID of the opportunity (use this or opportunity_number)",
+        },
+        opportunity_number: {
+          type: "string",
+          description: "Opportunity number like 'OPTY5331870' (use this or opportunity_id)",
+        },
+        forecast_category: {
+          type: "string",
+          enum: ["pipeline", "best_case", "committed", "upside"],
+          description: "New forecast category for the specialist forecast record",
+        },
+        business_unit: {
+          type: "string",
+          description: "BU name to disambiguate if multiple specialist forecasts exist for the same opportunity, e.g. 'Security'",
+        },
+        email: {
+          type: "string",
+          description: "Specialist email (defaults to authenticated user)",
+        },
+      },
+      required: ["forecast_category"],
+    },
+  },
+  {
+    name: "get_at_risk_deals",
+    description:
+      "Get open deals that need attention before a forecast call: overdue (past close date), stale (not updated in X days), or misaligned (committed/best_case with probability below 30%). Checks all three risk types by default.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: {
+          type: "string",
+          description: "User email (defaults to authenticated user)",
+        },
+        close_quarter: {
+          type: "string",
+          description: "Restrict to a specific close quarter, e.g. '26-Q2'",
+        },
+        stale_days: {
+          type: "number",
+          description: "Flag deals not modified in this many days (default: 30)",
+        },
+        include_overdue: {
+          type: "boolean",
+          description: "Include deals with a past close date (default: true)",
+        },
+        include_stale: {
+          type: "boolean",
+          description: "Include deals not updated recently (default: true)",
+        },
+        include_misaligned: {
+          type: "boolean",
+          description: "Include committed/best_case deals with probability below 30% (default: true)",
+        },
+      },
+    },
+  },
+  {
+    name: "search_opportunities",
+    description:
+      "Search opportunities by name or account name. Returns key forecast fields. Useful for quick lookups without writing OData filters.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Search term matched against opportunity name and account name",
+        },
+        status: {
+          type: "string",
+          enum: ["open", "won", "lost", "all"],
+          description: "Filter by opportunity status (default: open)",
+        },
+        close_quarter: {
+          type: "string",
+          description: "Optionally restrict to a specific close quarter, e.g. '26-Q3'",
+        },
+        top: {
+          type: "number",
+          description: "Max number of results (default: 15)",
+        },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
 export async function handleRecordTool(
@@ -728,6 +877,372 @@ export async function handleRecordTool(
         result = { id: newId, message: `Collaboration note added to opportunity ${opportunity_number ?? oppId}` };
         break;
       }
+      case "get_forecast_summary": {
+        const { close_quarter, email, business_units } = args as {
+          close_quarter: string;
+          email?: string;
+          business_units?: string[];
+        };
+
+        const userGuid = await resolveUserGuid(email);
+        const hasBuFilter = business_units && business_units.length > 0;
+        const buConditions = hasBuFilter
+          ? `<filter type="or">${business_units!.map((bu) => `<condition attribute="sn_name" operator="eq" value="${bu}"/>`).join("")}</filter>`
+          : "";
+        const buJoinType = hasBuFilter ? "inner" : "left-outer";
+
+        const fetchxml = `<fetch top="500">
+  <entity name="sn_specialistforecast">
+    <attribute name="sn_specialistforecastid"/>
+    <attribute name="sn_specialistforecastcategory"/>
+    <attribute name="sn_productnnacv"/>
+    <filter type="and">
+      <condition attribute="ownerid" operator="eq" value="${userGuid}"/>
+      <condition attribute="statecode" operator="eq" value="0"/>
+    </filter>
+    <link-entity name="sn_productbusinessunit" from="sn_productbusinessunitid" to="sn_businessunit" link-type="${buJoinType}" alias="bu">
+      <attribute name="sn_name"/>
+      ${buConditions}
+    </link-entity>
+    <link-entity name="opportunity" from="opportunityid" to="sn_opportunity" link-type="inner" alias="opp">
+      <attribute name="name"/>
+      <attribute name="sn_number"/>
+      <attribute name="sn_closequarter"/>
+      <attribute name="estimatedclosedate"/>
+      <attribute name="sn_salesstage"/>
+      <filter type="and">
+        <condition attribute="sn_closequarter" operator="eq" value="${close_quarter}"/>
+        <condition attribute="statecode" operator="eq" value="0"/>
+      </filter>
+    </link-entity>
+  </entity>
+</fetch>`;
+
+        const raw = await queryRecords({ entity: "sn_specialistforecasts", fetchxml });
+
+        const CATEGORY_LABELS: Record<number, string> = {
+          876130002: "committed",
+          876130001: "best_case",
+          876130006: "upside",
+          876130000: "pipeline",
+          876130003: "closed",
+        };
+
+        const byCategory: Record<string, { acv: number; count: number; deals: string[] }> = {};
+        const byBU: Record<string, Record<string, { acv: number; count: number }>> = {};
+        let totalACV = 0;
+
+        for (const row of raw.value) {
+          const catCode = row.sn_specialistforecastcategory as number;
+          const cat = CATEGORY_LABELS[catCode] ?? `unknown_${catCode}`;
+          const acv = (row.sn_productnnacv as number) ?? 0;
+          const oppNumber = (row["opp.sn_number"] as string) ?? "";
+          const bu = (row["bu.sn_name"] as string) ?? "Unknown";
+
+          if (!byCategory[cat]) byCategory[cat] = { acv: 0, count: 0, deals: [] };
+          byCategory[cat].acv += acv;
+          byCategory[cat].count += 1;
+          if (oppNumber && !byCategory[cat].deals.includes(oppNumber)) byCategory[cat].deals.push(oppNumber);
+
+          if (!byBU[bu]) byBU[bu] = {};
+          if (!byBU[bu][cat]) byBU[bu][cat] = { acv: 0, count: 0 };
+          byBU[bu][cat].acv += acv;
+          byBU[bu][cat].count += 1;
+
+          totalACV += acv;
+        }
+
+        result = {
+          quarter: close_quarter,
+          total_acv: totalACV,
+          total_records: raw.value.length,
+          by_category: byCategory,
+          by_business_unit: byBU,
+        };
+        break;
+      }
+
+      case "update_opportunity_forecast": {
+        const { opportunity_id, opportunity_number, forecast_category, close_date, close_quarter } = args as {
+          opportunity_id?: string;
+          opportunity_number?: string;
+          forecast_category?: string;
+          close_date?: string;
+          close_quarter?: string;
+        };
+
+        const oppId = await resolveOpportunityId(opportunity_id, opportunity_number);
+
+        const FORECAST_CODES: Record<string, number> = {
+          pipeline: 876130000,
+          best_case: 876130001,
+          committed: 876130002,
+          upside: 876130006,
+        };
+
+        const data: Record<string, unknown> = {};
+        if (forecast_category) data.sn_forecastcategory = FORECAST_CODES[forecast_category];
+        if (close_date) data.estimatedclosedate = close_date;
+        if (close_quarter) data.sn_closequarter = close_quarter;
+
+        if (Object.keys(data).length === 0) {
+          throw new Error("Provide at least one of: forecast_category, close_date, close_quarter.");
+        }
+
+        await updateRecord("opportunities", oppId, data);
+        result = {
+          message: `Opportunity ${opportunity_number ?? oppId} updated successfully`,
+          changes: data,
+        };
+        break;
+      }
+
+      case "update_specialist_forecast": {
+        const { opportunity_id, opportunity_number, forecast_category, business_unit, email } = args as {
+          opportunity_id?: string;
+          opportunity_number?: string;
+          forecast_category: string;
+          business_unit?: string;
+          email?: string;
+        };
+
+        const oppId = await resolveOpportunityId(opportunity_id, opportunity_number);
+        const userGuid = await resolveUserGuid(email);
+
+        const FORECAST_CODES: Record<string, number> = {
+          pipeline: 876130000,
+          best_case: 876130001,
+          committed: 876130002,
+          upside: 876130006,
+        };
+
+        const buFilter = business_unit
+          ? `<filter><condition attribute="sn_name" operator="eq" value="${business_unit}"/></filter>`
+          : "";
+        const buJoinType = business_unit ? "inner" : "left-outer";
+
+        const sfFetchxml = `<fetch top="10">
+  <entity name="sn_specialistforecast">
+    <attribute name="sn_specialistforecastid"/>
+    <attribute name="sn_specialistforecastcategory"/>
+    <filter type="and">
+      <condition attribute="ownerid" operator="eq" value="${userGuid}"/>
+      <condition attribute="sn_opportunity" operator="eq" value="${oppId}"/>
+      <condition attribute="statecode" operator="eq" value="0"/>
+    </filter>
+    <link-entity name="sn_productbusinessunit" from="sn_productbusinessunitid" to="sn_businessunit" link-type="${buJoinType}" alias="bu">
+      <attribute name="sn_name"/>
+      ${buFilter}
+    </link-entity>
+  </entity>
+</fetch>`;
+
+        const sfRecords = await queryRecords({ entity: "sn_specialistforecasts", fetchxml: sfFetchxml });
+
+        if (!sfRecords.value.length) {
+          throw new Error(
+            `No specialist forecast found for opportunity ${opportunity_number ?? oppId}${business_unit ? ` / BU ${business_unit}` : ""}`
+          );
+        }
+
+        const updated: { id: string; bu: string }[] = [];
+        for (const rec of sfRecords.value) {
+          const sfId = rec.sn_specialistforecastid as string;
+          await updateRecord("sn_specialistforecasts", sfId, {
+            sn_specialistforecastcategory: FORECAST_CODES[forecast_category],
+          });
+          updated.push({ id: sfId, bu: (rec["bu.sn_name"] as string) ?? "Unknown" });
+        }
+
+        result = {
+          message: `Updated ${updated.length} specialist forecast record(s) to '${forecast_category}'`,
+          updated,
+        };
+        break;
+      }
+
+      case "get_at_risk_deals": {
+        const {
+          email,
+          close_quarter,
+          stale_days = 30,
+          include_overdue = true,
+          include_stale = true,
+          include_misaligned = true,
+        } = args as {
+          email?: string;
+          close_quarter?: string;
+          stale_days?: number;
+          include_overdue?: boolean;
+          include_stale?: boolean;
+          include_misaligned?: boolean;
+        };
+
+        const userGuid = await resolveUserGuid(email);
+        const now = new Date();
+        const today = now.toISOString().split("T")[0];
+        const staleThreshold = new Date(now.getTime() - stale_days * 86400000).toISOString().split("T")[0];
+
+        const baseSelect = [
+          "name", "sn_number", "estimatedclosedate", "sn_forecastcategory",
+          "sn_netnewacv", "sn_salesstage", "sn_closequarter", "sn_probability", "modifiedon",
+        ];
+
+        const roleOrBlock = `
+          <filter type="or">
+            <condition attribute="ownerid" operator="eq" value="${userGuid}"/>
+            <condition attribute="sn_fieldsalesrep" operator="eq" value="${userGuid}"/>
+            <condition attribute="sn_solutionconsultant" operator="eq" value="${userGuid}"/>
+            <condition attribute="sn_secondarysalesrep" operator="eq" value="${userGuid}"/>
+          </filter>`;
+
+        const quarterCond = close_quarter
+          ? `<condition attribute="sn_closequarter" operator="eq" value="${close_quarter}"/>`
+          : "";
+
+        const atRisk: Record<string, unknown[]> = {};
+
+        if (include_overdue) {
+          const r = await queryRecords({
+            entity: "opportunities",
+            fetchxml: `<fetch top="50">
+  <entity name="opportunity">
+    ${baseSelect.map((f) => `<attribute name="${f}"/>`).join("\n    ")}
+    <filter type="and">
+      <condition attribute="statecode" operator="eq" value="0"/>
+      <condition attribute="estimatedclosedate" operator="lt" value="${today}"/>
+      ${quarterCond}
+      ${roleOrBlock}
+    </filter>
+    <order attribute="estimatedclosedate" descending="false"/>
+  </entity>
+</fetch>`,
+          });
+          atRisk.overdue = r.value;
+        }
+
+        if (include_stale) {
+          const r = await queryRecords({
+            entity: "opportunities",
+            fetchxml: `<fetch top="50">
+  <entity name="opportunity">
+    ${baseSelect.map((f) => `<attribute name="${f}"/>`).join("\n    ")}
+    <filter type="and">
+      <condition attribute="statecode" operator="eq" value="0"/>
+      <condition attribute="modifiedon" operator="lt" value="${staleThreshold}"/>
+      ${quarterCond}
+      ${roleOrBlock}
+    </filter>
+    <order attribute="modifiedon" descending="false"/>
+  </entity>
+</fetch>`,
+          });
+          atRisk[`stale_over_${stale_days}d`] = r.value;
+        }
+
+        if (include_misaligned) {
+          const r = await queryRecords({
+            entity: "opportunities",
+            fetchxml: `<fetch top="50">
+  <entity name="opportunity">
+    ${baseSelect.map((f) => `<attribute name="${f}"/>`).join("\n    ")}
+    <filter type="and">
+      <condition attribute="statecode" operator="eq" value="0"/>
+      <condition attribute="sn_probability" operator="lt" value="30"/>
+      <filter type="or">
+        <condition attribute="sn_forecastcategory" operator="eq" value="876130002"/>
+        <condition attribute="sn_forecastcategory" operator="eq" value="876130001"/>
+      </filter>
+      ${quarterCond}
+      ${roleOrBlock}
+    </filter>
+    <order attribute="sn_netnewacv" descending="true"/>
+  </entity>
+</fetch>`,
+          });
+          atRisk.misaligned_category = r.value;
+        }
+
+        const totalIssues = Object.values(atRisk).reduce((sum, arr) => sum + arr.length, 0);
+        result = {
+          checked_on: today,
+          stale_threshold_days: stale_days,
+          total_issues: totalIssues,
+          at_risk: atRisk,
+        };
+        break;
+      }
+
+      case "search_opportunities": {
+        const { query, status = "open", close_quarter, top = 15 } = args as {
+          query: string;
+          status?: string;
+          close_quarter?: string;
+          top?: number;
+        };
+
+        const STATUS_CODES: Record<string, number> = { open: 0, won: 1, lost: 2 };
+        const baseSelect = [
+          "opportunityid", "name", "sn_number", "sn_salesstage", "sn_forecastcategory",
+          "estimatedclosedate", "sn_netnewacv", "sn_closequarter", "statecode", "sn_probability",
+        ];
+
+        const statusFilter = status !== "all" ? ` and statecode eq ${STATUS_CODES[status] ?? 0}` : "";
+        const quarterFilter = close_quarter ? ` and sn_closequarter eq '${close_quarter}'` : "";
+
+        const byName = await queryRecords({
+          entity: "opportunities",
+          filter: `contains(name, '${query}')${statusFilter}${quarterFilter}`,
+          select: baseSelect,
+          orderby: "estimatedclosedate asc",
+          top,
+        });
+
+        const statusCond = status !== "all"
+          ? `<condition attribute="statecode" operator="eq" value="${STATUS_CODES[status] ?? 0}"/>`
+          : "";
+        const quarterCond = close_quarter
+          ? `<condition attribute="sn_closequarter" operator="eq" value="${close_quarter}"/>`
+          : "";
+
+        const byAccount = await queryRecords({
+          entity: "opportunities",
+          fetchxml: `<fetch top="${top}">
+  <entity name="opportunity">
+    ${baseSelect.map((f) => `<attribute name="${f}"/>`).join("\n    ")}
+    <filter type="and">
+      ${statusCond}
+      ${quarterCond}
+    </filter>
+    <link-entity name="account" from="accountid" to="customerid" link-type="inner" alias="acc">
+      <attribute name="name"/>
+      <filter>
+        <condition attribute="name" operator="like" value="%${query}%"/>
+      </filter>
+    </link-entity>
+    <order attribute="estimatedclosedate" descending="false"/>
+  </entity>
+</fetch>`,
+        });
+
+        const seen = new Set<string>();
+        const merged: unknown[] = [];
+        for (const opp of [...byName.value, ...byAccount.value]) {
+          const id = opp.opportunityid as string;
+          if (id && !seen.has(id)) {
+            seen.add(id);
+            merged.push(opp);
+          }
+        }
+
+        result = {
+          query,
+          total: merged.length,
+          opportunities: merged.slice(0, top),
+        };
+        break;
+      }
+
       default:
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }
