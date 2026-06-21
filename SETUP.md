@@ -90,6 +90,8 @@ Redémarrer Claude Desktop. Les outils `dynamics__*` apparaissent dans l'interfa
 
 ## Outils disponibles
 
+### Outils génériques (CRUD)
+
 | Outil | Description |
 |---|---|
 | `query_records` | Requête OData ou FetchXML sur n'importe quelle entité |
@@ -99,6 +101,27 @@ Redémarrer Claude Desktop. Les outils `dynamics__*` apparaissent dans l'interfa
 | `delete_record` | Supprime un enregistrement |
 | `get_entity_metadata` | Schéma d'une entité |
 | `list_entities` | Liste toutes les entités disponibles |
+
+### Outils opportunités & pipeline
+
+| Outil | Description |
+|---|---|
+| `get_my_opportunities` | Opportunités associées à un utilisateur (owner, field sales rep, SC…). Filtres : statut, forecast category, close quarter. |
+| `search_opportunities` | Recherche par nom d'opportunité ou nom de compte. |
+| `get_opportunity_products` | Lignes produit (SKUs) d'une opportunité. Accepte le GUID ou le numéro (ex. `OPTY5331870`). |
+| `add_opportunity_product` | Ajoute une ligne produit et son sous-produit à une opportunité. Crée la ligne parente si elle n'existe pas. |
+| `get_collaboration_notes` | Notes de collaboration d'une opportunité, triées par date décroissante. |
+| `add_collaboration_note` | Ajoute une note de collaboration (Next Steps / Win-Loss / General). |
+
+### Outils forecast specialist
+
+| Outil | Description |
+|---|---|
+| `get_specialist_opportunities` | Records `sn_specialistforecast` pour un spécialiste, filtrés par BU, trimestre et statut. |
+| `get_forecast_summary` | Résumé agrégé par trimestre : ACV et nombre de deals par catégorie et par BU. Outil principal pour préparer les forecast calls. |
+| `update_opportunity_forecast` | Met à jour la forecast category, la close date ou le close quarter sur une opportunité. |
+| `update_specialist_forecast` | Met à jour la forecast category sur le record `sn_specialistforecast` (niveau spécialiste). |
+| `get_at_risk_deals` | Deals ouverts à risque : en retard (past close date), stale (non mis à jour depuis X jours) ou mal alignés (committed/best_case avec proba < 30 %). |
 
 Exemple — récupérer une opportunité par numéro :
 
