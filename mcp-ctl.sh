@@ -62,7 +62,7 @@ ensure_env() {
     fi
     umask 077
     cat >"$ENV_FILE" <<EOF
-# Configuration du serveur MCP Dynamics — généré par mcp-ctl.sh le $(date -Is)
+# Configuration du serveur MCP Dynamics — généré par mcp-ctl.sh le $(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Ce fichier contient un secret : ne le commit pas (il est couvert par .gitignore).
 MCP_DYNAMICS_HTTP_TOKEN=$token
 MCP_DYNAMICS_HTTP_HOST=127.0.0.1
@@ -97,18 +97,43 @@ running_pid() {
 }
 
 # Empêche deux daemons sur le même port : le fichier PID ment, on le nettoie.
+# `ss` est Linux ; macOS/BSD passent par lsof.
 port_owner() {
+  local p; p="$(port)"
   if command -v ss >/dev/null 2>&1; then
-    ss -ltnp 2>/dev/null | awk -v p=":"$(port)"$" '$4 ~ p {print $NF}' | head -1
+    ss -ltnp 2>/dev/null | awk -v p=":$p$" '$4 ~ p {print $NF}' | head -1
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$p" -sTCP:LISTEN -t 2>/dev/null | head -1
   fi
 }
 
 health() { curl -fsS --max-time 3 "$(base)/healthz" 2>/dev/null; }
 
+# Secondes écoulées depuis le démarrage du process. GNU ps expose `etimes` ;
+# celui de BSD/macOS non — on convertit alors `lstart` en epoch via date.
+elapsed_of() {
+  local pid="$1" start now start_epoch
+  if ps -o etimes= -p "$pid" >/dev/null 2>&1; then
+    ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' '
+    return 0
+  fi
+  start="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//')" || return 1
+  [ -n "$start" ] || return 1
+  now="$(date +%s)"
+  if start_epoch="$(date -j -f '%a %b %e %T %Y' "$start" +%s 2>/dev/null)"; then
+    :                                        # BSD (macOS)
+  elif start_epoch="$(date -d "$start" +%s 2>/dev/null)"; then
+    :                                        # GNU (Linux)
+  else
+    return 1
+  fi
+  printf '%s' "$(( now - start_epoch ))"
+}
+
 uptime_of() {
   local pid="$1" start elapsed
   start="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//')" || return 1
-  elapsed="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')"
+  elapsed="$(elapsed_of "$pid")" || elapsed=""
   if [ -n "$elapsed" ]; then
     printf '%s — en ligne depuis %ss\n' "$start" "$elapsed"
   else
@@ -148,31 +173,48 @@ do_start() {
   mkdir -p "$LOG_DIR" "$(dirname "$PID_FILE")"
   : >>"$LOG_FILE"
 
-  # setsid : le daemon survit à la fermeture du terminal et à Ctrl-C.
-  setsid nohup node "$MAIN" >>"$LOG_FILE" 2>&1 &
-  local pid=$!
-  echo "$pid" >"$PID_FILE"
+  # Détachement du daemon. `setsid` n'existe que sur Linux ; sur macOS/BSD c'est
+  # `nohup` + le job en arrière-plan qui assure la survie à la fermeture du
+  # terminal et à Ctrl-C. Quand setsid est présent, le fichier PID est écrit par le
+  # wrapper (et non par `$!`) : setsid fork quand il est chef de groupe — ce qui
+  # est le cas d'un job en arrière-plan — et `$!` serait alors le PID du wrapper
+  # éphémère, pas celui de node. `exec` fait hériter le PID au vrai serveur.
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid bash -c 'echo $$ >"$1"; exec node "$2"' _ "$PID_FILE" "$MAIN" \
+      >>"$LOG_FILE" 2>&1 &
+  else
+    nohup bash -c 'echo $$ >"$1"; exec node "$2"' _ "$PID_FILE" "$MAIN" \
+      >>"$LOG_FILE" 2>&1 &
+  fi
+  disown 2>/dev/null || true
 
-  local i
-  for i in $(seq 1 40); do
-    if health >/dev/null 2>&1; then
-      ok "Démarré (PID $pid) — $(base)/mcp"
-      dim "token   : $(./mcp-ctl.sh token)"
-      dim "logs    : ./mcp-ctl.sh logs -f"
-      return 0
-    fi
-    if ! kill -0 "$pid" 2>/dev/null; then
+  # Attente de /healthz. Le délai est mesuré, pas compté en tours : chaque
+  # `health` peut bloquer jusqu'à --max-time, donc un compteur de tours ferait
+  # un budget largement supérieur à celui annoncé.
+  local pid='' deadline="$(( $(date +%s) + 30 ))"
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      if health >/dev/null 2>&1; then
+        ok "Démarré (PID $pid) — $(base)/mcp"
+        dim "token   : $(./mcp-ctl.sh token)"
+        dim "logs    : ./mcp-ctl.sh logs -f"
+        return 0
+      fi
+    elif [ -n "$pid" ]; then
+      # Le wrapper a publié un PID déjà mort : le serveur a quitté au démarrage.
       rm -f "$PID_FILE"
       printf '%s\n' "--- dernières lignes de $LOG_FILE ---" >&2
       tail -n 20 "$LOG_FILE" >&2
       die "le serveur a quitté au démarrage (voir ci-dessus)."
     fi
+    # PID pas encore publié par le wrapper, ou /healthz pas encore prêt.
     sleep 0.25
   done
 
   rm -f "$PID_FILE"
   tail -n 20 "$LOG_FILE" >&2
-  die "pas de réponse sur /healthz après 10 s (voir $LOG_FILE)."
+  die "pas de réponse sur /healthz après 30 s (voir $LOG_FILE)."
 }
 
 do_stop() {
