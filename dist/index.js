@@ -1,22 +1,30 @@
 #!/usr/bin/env node
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+/**
+ * Transport stdio : le mode historique, utilisé par Claude Code / Claude Desktop.
+ *
+ * ⚠️ Ce mode n'est PAS un daemon. Le client MCP spawn ce process, parle sur
+ * stdin/stdout, et le process meurt avec le client. Pour un service qui
+ * tourne en arrière-plan, voir `src/http.ts` (transport Streamable HTTP).
+ */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
-import { recordTools, handleRecordTool } from "./tools/records.js";
-const server = new Server({ name: "mcp-dynamics", version: "1.0.0" }, { capabilities: { tools: {} } });
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: recordTools,
-}));
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    const { name, arguments: args } = req.params;
-    return handleRecordTool(name, (args ?? {}));
-});
+import { createMcpServer } from "./server.js";
+import { environment } from "./dataverse.js";
+import { logJson } from "./log.js";
+import { recordTools } from "./tools/records.js";
 async function main() {
+    const server = createMcpServer();
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("mcp-dynamics server running (stdio)");
+    // stderr uniquement : stdout porte le protocole MCP.
+    logJson({
+        event: "server_started",
+        transport: "stdio",
+        tools: recordTools.length,
+        environment: environment(),
+    });
 }
 main().catch((err) => {
-    console.error("Fatal error:", err);
+    logJson({ event: "fatal", error: err instanceof Error ? err.message : String(err) });
     process.exit(1);
 });
+//# sourceMappingURL=index.js.map

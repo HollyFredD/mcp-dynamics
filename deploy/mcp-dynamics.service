@@ -1,0 +1,43 @@
+[Unit]
+Description=MCP Dynamics 365 (transport Streamable HTTP)
+Documentation=https://github.com/HollyFredD/mcp-dynamics
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/GitHub/mcp-dynamics
+ExecStart=/usr/bin/node dist/http.js
+Restart=on-failure
+RestartSec=5
+
+# --- Sécurité ---------------------------------------------------------------
+# Le serveur agit avec l'identité Azure CLI de User= ci-dessus : quiconque
+# atteint le port écrit dans son CRM. Ne jamais exposer ce port sur Internet.
+Environment=MCP_DYNAMICS_TRANSPORT=http
+Environment=MCP_DYNAMICS_HTTP_HOST=127.0.0.1
+Environment=MCP_DYNAMICS_HTTP_PORT=3000
+Environment=MCP_DYNAMICS_READONLY=1
+Environment=DYNAMICS_INSTANCE_URL=https://servicenow.crm.dynamics.com
+
+# ⚠️ Le token DOIT sortir de ce fichier : lis-le d'un fichier root-only.
+#   mkdir -p /etc/mcp-dynamics && openssl rand -hex 32 > /etc/mcp-dynamics/token
+#   chmod 600 /etc/mcp-dynamics/token
+EnvironmentFile=/etc/mcp-dynamics/env
+
+# --- Durcissement ----------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/YOUR_USER/GitHub/mcp-dynamics/tui/logs
+# `az login` a besoin d'écrire dans ~/.azure : indispensable, car c'est lui qui
+# fournit le token. Ne pas ajouter ProtectHome=true sans cela.
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+{
+  "instanceUrl": "auto",
+  "serverPath": "dist/index.js",
+  "serverCommand": "node",
+  "serverArgs": [],
+  "timeoutMs": 30000,
+  "benchRuns": 10,
+  "dashboardIntervalMs": 2000,
+  "verbose": false,
+  "logDir": "tui/logs"
+}
