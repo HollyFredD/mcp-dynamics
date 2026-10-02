@@ -13,6 +13,7 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "start:http": "node dist/http.js",
+    "ctl": "./mcp-ctl.sh",
     "health-check": "npm run build && node scripts/health-check.mjs",
     "health-check:http": "npm run build && node scripts/health-check-http.mjs",
     "prepublishOnly": "npm run typecheck && npm run build",

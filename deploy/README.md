@@ -22,7 +22,36 @@ curl -s localhost:3000/healthz | jq
 npm run health-check:http    # 8 vérifications, démarre le serveur si besoin
 ```
 
-## 2. Service systemd
+C'est le mode « foreground », pratique pour lire les logs. Pour un vrai
+daemon (start/stop/status), voir §2.
+
+## 2. Gestion en local : `mcp-ctl.sh`
+
+En développement, pas besoin de systemd — le script root `mcp-ctl.sh` (ou
+`npm run ctl -- <cmd>`) pilote le daemon :
+
+```bash
+./mcp-ctl.sh start      # build si besoin, génère ./.env.http + un token, attend /healthz
+./mcp-ctl.sh status     # PID, uptime, outils, sessions, read-only, instance
+./mcp-ctl.sh logs -f    # NDJSON du serveur
+./mcp-ctl.sh restart
+./mcp-ctl.sh stop       # SIGTERM, puis SIGKILL après 10 s
+./mcp-ctl.sh token      # le Bearer token à copier côté client
+```
+
+| Où | Quoi |
+|---|---|
+| `.env.http` | config + token, mode 600, gitignoré (`.env.*`), créé au 1er `start` |
+| `logs/http.log` | sortie stderr du daemon |
+| `$XDG_RUNTIME_DIR/mcp-dynamics/mcp-dynamics.pid` | PID ( `/tmp/...` si `XDG_RUNTIME_DIR` absent) |
+
+`start` refuse de démarrer si le port est déjà occupé, si le serveur ne
+répond pas sur `/healthz` sous 10 s (il affiche alors le log), ou si le
+service systemd `mcp-dynamics` est déjà actif. `status` renvoie 3 si le
+serveur est arrêté, 4 s'il est vivant mais ne répond plus — exploitable
+en supervision.
+
+## 3. Service systemd
 
 ```bash
 sudo cp deploy/mcp-dynamics.service /etc/systemd/system/
@@ -47,7 +76,7 @@ Récupérer le token pour le client MCP :
 sudo cat /etc/mcp-dynamics/token
 ```
 
-## 3. Connecter Claude
+## 4. Connecter Claude
 
 `~/.claude.json` (Claude Code) ou `claude_desktop_config.json` :
 
@@ -71,7 +100,7 @@ Sans en-têtes, sur le mode stdio uniquement :
 } } }
 ```
 
-## 4. Depuis une autre machine
+## 5. Depuis une autre machine
 
 Le service écoute sur `127.0.0.1` par défaut. Pour ouvrir le port, préférez un
 tunnel SSH plutôt qu'un bind sur `0.0.0.0` — le token Bearer ne doit jamais
