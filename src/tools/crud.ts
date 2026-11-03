@@ -11,8 +11,10 @@ import {
   listEntities,
   assertEntityWritable,
   assertEntityDeletable,
+  rawGet,
 } from "../dataverse.js";
 import { odataString, labelOf, fetchxmlValue } from "../odata.js";
+import { withTop, condition, type FetchOperator } from "../fetchxml.js";
 import {
   MAX_PAGE_SIZE,
   DEFAULT_QUERY_ROWS,
@@ -29,7 +31,7 @@ import {
   str,
   strArray,
 } from "../validate.js";
-import { buildDiff, logMutation, verifyWrite } from "./common.js";
+import { DRY_RUN_PROP, buildDiff, logMutation, verifyWrite } from "./common.js";
 
 export type ToolDef = {
   name: string;
@@ -42,14 +44,6 @@ export type ToolDef = {
 };
 
 export type ToolHandler = (args: Record<string, unknown>) => Promise<unknown>;
-
-const DRY_RUN_PROP = {
-  dry_run: {
-    type: "boolean",
-    description:
-      "When true (DEFAULT) nothing is written: the tool returns the exact diff it WOULD apply. Set false to actually write.",
-  },
-} as const;
 
 const CONFIRM_PROP = {
   confirm: {
@@ -151,10 +145,12 @@ async function handleQueryRecords(args: Record<string, unknown>): Promise<unknow
   let countExact = false;
 
   if (fetchAll && fetchxml) {
-    // Le FetchXML n'expose pas de @odata.nextLink : on incrémente `top`.
+    // Le FetchXML n'expose pas de @odata.nextLink : `withTop` garantit que la
+    // requête change à chaque page (sans attribut `top`, l'ancien replace était
+    // un no-op et les mêmes lignes revenaient en doublon).
     const res = await queryAllFetchXml({
       entity,
-      buildFetch: (t) => fetchxml!.replace(/top="\d+"/, `top="${t}"`),
+      buildFetch: (t) => withTop(fetchxml!, t),
       page_size: top,
       max_pages: maxPages,
       max_records: maxRows,
@@ -750,18 +746,52 @@ const aggregateQueryTool: ToolDef = {
   },
 };
 
+const FILTER_OPS: Record<string, FetchOperator> = {
+  eq: "eq",
+  neq: "neq",
+  gt: "gt",
+  geq: "geq",
+  lt: "lt",
+  leq: "leq",
+};
+
+/**
+ * Traduit un sous-ensemble d'OData $filter en conditions FetchXML.
+ *
+ * ⚠️ L'ancienne version faisait `if (!m) continue;` : une clause non reconnue
+ * (or, contains, date…) était SILENCIEUSEMENT jetée. L'agrégat renvoyé portait
+ * alors sur un périmètre plus large que demandé — un total faux sans le moindre
+ * avertissement. Désormais toute clause non traduisible lève une erreur.
+ */
 function odataToFetchConditions(filter: string): string[] {
-  // Traduction d'un sous-ensemble d'OData $filter en conditions FetchXML.
-  const parts = filter.split(/\s+and\s+/i).map((p) => p.trim()).filter(Boolean);
-  const out: string[] = [];
-  for (const part of parts) {
+  const parts = filter
+    .split(/\s+and\s+/i)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  return parts.map((part) => {
     const m = /^([A-Za-z_][A-Za-z0-9_]*)\s+(eq|neq|gt|geq|lt|leq)\s+(.+)$/i.exec(part);
-    if (!m) continue; // sous-ensembles non supportés : ignorés silencieusement
-    const [, attr, op, rawVal] = m;
-    const value = rawVal.replace(/^'/, "").replace(/'$/, "").replace(/''/g, "'");
-    out.push(`<condition attribute="${fetchxmlValue(attr)}" operator="${op.toLowerCase()}" value="${fetchxmlValue(value)}" />`);
-  }
-  return out;
+    if (!m) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Unsupported filter clause '${part}'. Supported grammar: "field eq value and field2 geq 5". For or/contains/date logic use query_records with FetchXML.`
+      );
+    }
+    const [, attribute, opRaw, rawVal] = m;
+    const raw = rawVal.trim();
+    let value: string | number;
+    if (/^'.*'$/.test(raw)) {
+      value = raw.slice(1, -1).replace(/''/g, "'");
+    } else if (/^-?\d+(?:\.\d+)?$/.test(raw)) {
+      value = Number(raw);
+    } else {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Unsupported filter value '${raw}' in clause '${part}'. Quote strings ('text') or pass a number.`
+      );
+    }
+    return condition({ attribute, operator: FILTER_OPS[opRaw.toLowerCase()], value });
+  });
 }
 
 async function handleAggregateQuery(args: Record<string, unknown>): Promise<unknown> {
@@ -855,17 +885,7 @@ function oneOfAgg(v: unknown, index: number): AggFn {
 }
 
 // ===========================================================================
-// rawGet : petit utilitaire interne (métadonnées)
-// ===========================================================================
-async function rawGet<T>(path: string): Promise<T> {
-  const mod = await import("../dataverse.js");
-  const api = await mod.getClient();
-  const { bumpDataverseCall } = await import("../log.js");
-  bumpDataverseCall();
-  const res = await api.request<T>({ method: "get", url: path });
-  return res.data;
-}
-
+// (rawGet est désormais exporté par dataverse.ts, avec retry + erreurs nettoyées)
 // ===========================================================================
 
 export const crudTools: ToolDef[] = [

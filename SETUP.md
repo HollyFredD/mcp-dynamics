@@ -112,6 +112,11 @@ Redémarrer Claude Desktop. Les outils `dynamics__*` apparaissent dans l'interfa
 | `MCP_DYNAMICS_HTTP_HOST` | `127.0.0.1` | Interface d'écoute du serveur HTTP. |
 | `MCP_DYNAMICS_HTTP_PORT` | `3000` | Port d'écoute. |
 | `MCP_DYNAMICS_HTTP_RATE` | `120` | Requêtes/minute/IP. |
+| `MCP_DYNAMICS_MAX_SESSIONS` | `100` | Plafond de sessions MCP simultanées (borne la mémoire du daemon). Au-delà : HTTP 503. |
+| `MCP_DYNAMICS_SESSION_IDLE_MS` | `1800000` | Durée d'inactivité (30 min) après laquelle une session HTTP est fermée automatiquement. |
+| `MCP_DYNAMICS_ALLOWED_ORIGINS` | *(vide)* | Origines navigateur autorisées (CSV). Vide = tout en-tête `Origin` est refusé (anti DNS-rebinding). |
+| `MCP_DYNAMICS_CACHE_MAX` | `1000` | Nombre max d'entrées du cache mémoire (LRU). |
+| `MCP_DYNAMICS_MAX_OUTPUT` | `200000` | Plafond dur (caractères) de la sortie texte renvoyée au modèle. Au-delà : enveloppe `output_truncated`. |
 
 `MCP_DYNAMICS_READONLY` est volontairement strict : en HTTP il vaut `1` par
 défaut, et **seul `0` le désactive** — `foo`, `true` ou une chaîne vide

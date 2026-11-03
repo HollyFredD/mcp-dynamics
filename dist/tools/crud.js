@@ -1,16 +1,11 @@
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import { queryRecords, queryAll, queryAllFetchXml, getRecord, createRecord, updateRecord, deleteRecord, getEntityMetadata, listEntities, assertEntityWritable, assertEntityDeletable, } from "../dataverse.js";
+import { queryRecords, queryAll, queryAllFetchXml, getRecord, createRecord, updateRecord, deleteRecord, getEntityMetadata, listEntities, assertEntityWritable, assertEntityDeletable, rawGet, } from "../dataverse.js";
 import { odataString, labelOf, fetchxmlValue } from "../odata.js";
+import { withTop, condition } from "../fetchxml.js";
 import { MAX_PAGE_SIZE, DEFAULT_QUERY_ROWS, CACHE_TTL_MS, } from "../constants.js";
 import { cacheWrap } from "../cache.js";
 import { bool, entityName, guidParam, intIn, record, requiredStr, str, strArray, } from "../validate.js";
-import { buildDiff, logMutation, verifyWrite } from "./common.js";
-const DRY_RUN_PROP = {
-    dry_run: {
-        type: "boolean",
-        description: "When true (DEFAULT) nothing is written: the tool returns the exact diff it WOULD apply. Set false to actually write.",
-    },
-};
+import { DRY_RUN_PROP, buildDiff, logMutation, verifyWrite } from "./common.js";
 const CONFIRM_PROP = {
     confirm: {
         type: "boolean",
@@ -100,10 +95,12 @@ async function handleQueryRecords(args) {
     /** true si `total` vient de $count (donc exact) et non d'un comptage local. */
     let countExact = false;
     if (fetchAll && fetchxml) {
-        // Le FetchXML n'expose pas de @odata.nextLink : on incrémente `top`.
+        // Le FetchXML n'expose pas de @odata.nextLink : `withTop` garantit que la
+        // requête change à chaque page (sans attribut `top`, l'ancien replace était
+        // un no-op et les mêmes lignes revenaient en doublon).
         const res = await queryAllFetchXml({
             entity,
-            buildFetch: (t) => fetchxml.replace(/top="\d+"/, `top="${t}"`),
+            buildFetch: (t) => withTop(fetchxml, t),
             page_size: top,
             max_pages: maxPages,
             max_records: maxRows,
@@ -594,19 +591,46 @@ const aggregateQueryTool = {
         required: ["entity", "measures"],
     },
 };
+const FILTER_OPS = {
+    eq: "eq",
+    neq: "neq",
+    gt: "gt",
+    geq: "geq",
+    lt: "lt",
+    leq: "leq",
+};
+/**
+ * Traduit un sous-ensemble d'OData $filter en conditions FetchXML.
+ *
+ * ⚠️ L'ancienne version faisait `if (!m) continue;` : une clause non reconnue
+ * (or, contains, date…) était SILENCIEUSEMENT jetée. L'agrégat renvoyé portait
+ * alors sur un périmètre plus large que demandé — un total faux sans le moindre
+ * avertissement. Désormais toute clause non traduisible lève une erreur.
+ */
 function odataToFetchConditions(filter) {
-    // Traduction d'un sous-ensemble d'OData $filter en conditions FetchXML.
-    const parts = filter.split(/\s+and\s+/i).map((p) => p.trim()).filter(Boolean);
-    const out = [];
-    for (const part of parts) {
+    const parts = filter
+        .split(/\s+and\s+/i)
+        .map((p) => p.trim())
+        .filter(Boolean);
+    return parts.map((part) => {
         const m = /^([A-Za-z_][A-Za-z0-9_]*)\s+(eq|neq|gt|geq|lt|leq)\s+(.+)$/i.exec(part);
-        if (!m)
-            continue; // sous-ensembles non supportés : ignorés silencieusement
-        const [, attr, op, rawVal] = m;
-        const value = rawVal.replace(/^'/, "").replace(/'$/, "").replace(/''/g, "'");
-        out.push(`<condition attribute="${fetchxmlValue(attr)}" operator="${op.toLowerCase()}" value="${fetchxmlValue(value)}" />`);
-    }
-    return out;
+        if (!m) {
+            throw new McpError(ErrorCode.InvalidParams, `Unsupported filter clause '${part}'. Supported grammar: "field eq value and field2 geq 5". For or/contains/date logic use query_records with FetchXML.`);
+        }
+        const [, attribute, opRaw, rawVal] = m;
+        const raw = rawVal.trim();
+        let value;
+        if (/^'.*'$/.test(raw)) {
+            value = raw.slice(1, -1).replace(/''/g, "'");
+        }
+        else if (/^-?\d+(?:\.\d+)?$/.test(raw)) {
+            value = Number(raw);
+        }
+        else {
+            throw new McpError(ErrorCode.InvalidParams, `Unsupported filter value '${raw}' in clause '${part}'. Quote strings ('text') or pass a number.`);
+        }
+        return condition({ attribute, operator: FILTER_OPS[opRaw.toLowerCase()], value });
+    });
 }
 async function handleAggregateQuery(args) {
     const entity = entityName(args.entity);
@@ -672,16 +696,7 @@ function oneOfAgg(v, index) {
     return hit;
 }
 // ===========================================================================
-// rawGet : petit utilitaire interne (métadonnées)
-// ===========================================================================
-async function rawGet(path) {
-    const mod = await import("../dataverse.js");
-    const api = await mod.getClient();
-    const { bumpDataverseCall } = await import("../log.js");
-    bumpDataverseCall();
-    const res = await api.request({ method: "get", url: path });
-    return res.data;
-}
+// (rawGet est désormais exporté par dataverse.ts, avec retry + erreurs nettoyées)
 // ===========================================================================
 export const crudTools = [
     queryRecordsTool,

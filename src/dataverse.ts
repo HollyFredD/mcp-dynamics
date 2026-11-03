@@ -21,8 +21,10 @@ import {
   DELETE_DENYLIST,
   CURRENCY_GUIDS,
   PRIMARY_UNIT_ID,
+  CACHE_TTL_MS_LONG,
 } from "./constants.js";
 import { odataString, guid as validateGuid, labelOf, assertEntityName } from "./odata.js";
+import { withPaging } from "./fetchxml.js";
 import { cacheWrap, cacheGet, cacheSet } from "./cache.js";
 import { bumpDataverseCall, logJson, redact } from "./log.js";
 
@@ -180,18 +182,31 @@ function buildClient(token: string): AxiosInstance {
       if (!axios.isAxiosError(error) || !error.config) throw error;
       const cfg = error.config as RetryConfig;
       const status = error.response?.status;
-      const retryable = status === 429 || (status !== undefined && status >= 500);
+      const method = String(cfg.method ?? "get").toLowerCase();
+      /**
+       * Seules les méthodes idempotentes sont rejouées sur 5xx : rejouer un
+       * POST peut créer un DOUBLON (le serveur a pu appliquer la requête avant
+       * de répondre 502). Un 429, lui, garantit que rien n'a été appliqué.
+       */
+      const idempotent = method === "get" || method === "patch" || method === "delete";
+      const retryable = status === 429 || (idempotent && status !== undefined && status >= 500);
+      const transient =
+        idempotent &&
+        status === undefined &&
+        ["ECONNRESET", "ETIMEDOUT", "EAI_AGAIN", "ECONNABORTED"].includes(
+          String(error.code ?? "")
+        );
 
-      if (retryable && (cfg.__retries ?? 0) < MAX_RETRIES) {
+      if ((retryable || transient) && (cfg.__retries ?? 0) < MAX_RETRIES) {
         cfg.__retries = (cfg.__retries ?? 0) + 1;
         const retryAfter = String(error.response?.headers?.["retry-after"] ?? "");
         const delay = retryDelay(cfg.__retries - 1, retryAfter);
         logJson({
           event: "dataverse_retry",
-          status,
+          status: status ?? error.code ?? "network",
           attempt: cfg.__retries,
           delay_ms: delay,
-          method: cfg.method?.toUpperCase(),
+          method: method.toUpperCase(),
         });
         await sleep(delay);
         bumpDataverseCall();
@@ -262,8 +277,20 @@ async function send<T>(
     });
     return res.data;
   } catch (err) {
-    throw formatDataverseError(err, url);
+    throw formatDataverseError(err, url, isWrite);
   }
+}
+
+/**
+ * GET brut (métadonnées Dataverse) passant par la couche unifiée : mêmes
+ * timeouts, mêmes retries et surtout mêmes erreurs formatées/nettoyées.
+ * L'ancien `rawGet` local à `crud.ts` jetait l'erreur axios brute.
+ */
+export async function rawGet<T>(
+  path: string,
+  headers: Record<string, string> = {}
+): Promise<T> {
+  return send<T>("get", path, { headers });
 }
 
 // ---------------------------------------------------------------------------
@@ -319,7 +346,7 @@ function statusHint(status: number | undefined, write: boolean): string {
 }
 
 /** Convertit une erreur axios en McpError enrichie (statut HTTP + hint). */
-export function formatDataverseError(err: unknown, url = ""): McpError {
+export function formatDataverseError(err: unknown, url = "", isWrite = false): McpError {
   if (err instanceof McpError) return err;
 
   if (axios.isAxiosError(err)) {
@@ -332,7 +359,7 @@ export function formatDataverseError(err: unknown, url = ""): McpError {
     const code = err.code === "ECONNABORTED" ? " (timeout)" : "";
     return new McpError(
       ErrorCode.InternalError,
-      `Dataverse HTTP ${status ?? "network"}${code} — ${short}. Hint: ${statusHint(status, false)} [path: ${url.split("?")[0]}]`
+      `Dataverse HTTP ${status ?? "network"}${code} — ${short}. Hint: ${statusHint(status, isWrite)} [path: ${url.split("?")[0]}]`
     );
   }
 
@@ -400,14 +427,20 @@ export interface QueryOptions {
   skip?: number;
   count?: boolean;
   fetchxml?: string;
-  /** Réactive `Prefer: odata.include-annotations=*` pour CETTE requête. */
-  include_annotations?: boolean;
+  /**
+   * Réactive `Prefer: odata.include-annotations` pour CETTE requête.
+   * `true` = toutes les annotations (`*`). Une chaîne = liste ciblée, par
+   * exemple `Microsoft.Dynamics.CRM.fetchxmlpagingcookie` (payload minuscule).
+   */
+  include_annotations?: boolean | string;
 }
 
 export interface QueryResult {
   value: Record<string, unknown>[];
   "@odata.nextLink"?: string;
   "@odata.count"?: number;
+  /** Annotations Dataverse (ex. `@Microsoft.Dynamics.CRM.fetchxmlpagingcookie`). */
+  [annotation: string]: unknown;
 }
 
 export async function queryRecords(opts: QueryOptions): Promise<QueryResult> {
@@ -420,7 +453,11 @@ export async function queryRecords(opts: QueryOptions): Promise<QueryResult> {
   }
 
   const headers: Record<string, string> = {};
-  if (opts.include_annotations) headers.Prefer = "odata.include-annotations=*";
+  if (opts.include_annotations) {
+    const value =
+      typeof opts.include_annotations === "string" ? opts.include_annotations : "*";
+    headers.Prefer = `odata.include-annotations=${value}`;
+  }
 
   if (opts.fetchxml) {
     const params = new URLSearchParams({ fetchXml: opts.fetchxml });
@@ -509,7 +546,9 @@ export async function queryAll(opts: QueryAllOptions): Promise<QueryAllResult> {
 
   const value = pages.flat();
   const total_records = count ?? value.length;
-  const truncated = value.length < total_records || (url !== undefined && pageCount >= maxPages);
+  // Une URL encore présente signifie qu'il reste des pages : c'est le seul
+  // signal fiable quand $count est absent (ancienne formule : faux négatif).
+  const truncated = (count !== undefined && value.length < count) || url !== undefined;
 
   return {
     value,
@@ -523,15 +562,20 @@ export async function queryAll(opts: QueryAllOptions): Promise<QueryAllResult> {
 }
 
 /**
- * H4 (FetchXML) : le FetchXML n'expose PAS de `@odata.nextLink` — la seule
- * façon de paginer est d'incrémenter `top`. Cette fonction loop jusqu'à
- * épuisement ou plafond, ce qui supprime le plafonnement silencieux à 500
- * lignes de get_forecast_summary (bug de production majeur : les totaux étaient
- * sous-estimés sans aucun avertissement).
+ * H4 (FetchXML) : le FetchXML n'expose PAS de `@odata.nextLink`.
+ *
+ * Historique : l'ancienne implémentation relançait la requête avec
+ * `top = (pages+1) * pageSize`, donc relisait TOUT depuis le début à chaque
+ * page — 5 000 lignes coûtaient ~27 500 lignes transférées (O(n²)).
+ *
+ * Désormais : pagination serveur native (`page` + `count` + `pagingcookie`).
+ * On demande uniquement l'annotation du cookie (payload minuscule), on déduplique
+ * les lignes par identité et on s'arrête dès qu'une page n'apporte rien de
+ * nouveau — plus de doublons, plus de croissance quadratique.
  */
 export async function queryAllFetchXml(opts: {
   entity: string;
-  /** Reconstruit le FetchXML avec un `top` donné. */
+  /** Reconstruit le FetchXML de base (le `top` est ignoré : le paging le remplace). */
   buildFetch: (top: number) => string;
   page_size?: number;
   max_pages?: number;
@@ -539,31 +583,54 @@ export async function queryAllFetchXml(opts: {
 }): Promise<QueryAllResult> {
   const pageSize = Math.min(opts.page_size ?? 500, MAX_PAGE_SIZE);
   const maxPages = Math.max(1, opts.max_pages ?? DEFAULT_MAX_PAGES);
-  const maxRecords = opts.max_records ?? maxPages * pageSize;
+  const maxRecords = Math.max(1, opts.max_records ?? maxPages * pageSize);
 
   const collected: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
   let pages = 0;
-  let truncated = false;
+  let exhausted = false;
+  let cookie: string | undefined;
 
   while (pages < maxPages && collected.length < maxRecords) {
-    const top = (pages + 1) * pageSize;
+    const page = pages + 1;
+    const xml = withPaging(opts.buildFetch(pageSize), page, pageSize, cookie);
     const res = await queryRecords({
       entity: opts.entity,
-      fetchxml: opts.buildFetch(top),
+      fetchxml: xml,
+      include_annotations: "Microsoft.Dynamics.CRM.fetchxmlpagingcookie",
     });
     pages += 1;
-    collected.push(...res.value);
-    if (res.value.length < top) {
+
+    let added = 0;
+    for (const row of res.value) {
+      const key = JSON.stringify(row);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      collected.push(row);
+      added += 1;
+      if (collected.length >= maxRecords) break;
+    }
+
+    const nextCookie = res["@Microsoft.Dynamics.CRM.fetchxmlpagingcookie"];
+    cookie = typeof nextCookie === "string" ? nextCookie : undefined;
+
+    if (res.value.length < pageSize) {
+      // Dernière page incomplète : le serveur a tout rendu.
+      exhausted = true;
       break;
     }
-    truncated = true;
+    if (added === 0) {
+      // Le serveur ignore la pagination : s'arrêter plutôt que boucler.
+      break;
+    }
   }
 
-  const value = collected.length > maxRecords ? collected.slice(0, maxRecords) : collected;
+  const value = collected.slice(0, maxRecords);
+  const truncated = !exhausted;
   return {
     value,
     pages,
-    truncated: truncated && value.length >= maxRecords,
+    truncated,
     total_records: value.length,
     has_more: truncated,
   };
@@ -614,7 +681,7 @@ export async function createRecord(
     });
     res = { data: r.data, headers: r.headers as unknown as Record<string, unknown> };
   } catch (err) {
-    throw formatDataverseError(err, `/${e}`);
+    throw formatDataverseError(err, `/${e}`, true);
   }
 
   // 204 No Content renvoie "" : on normalise en objet avant de lire.
@@ -689,21 +756,18 @@ export async function deleteRecord(entity: string, id: string): Promise<void> {
 // ---------------------------------------------------------------------------
 // Métadonnées
 // ---------------------------------------------------------------------------
-const PRIMARY_ID_CACHE = new Map<string, string>();
-
+/**
+ * Nom de l'attribut clé primaire d'une entité (mis en cache).
+ *
+ * Un seul cache (`cacheWrap`) : l'ancien code doublait la couche avec une Map
+ * locale qui gardait les valeurs indéfiniment, y compris après `cacheClear()`.
+ */
 export async function getPrimaryIdAttribute(entity: string): Promise<string | undefined> {
-  const cached = cacheGet<string>(`primaryid:${entity}`);
-  if (cached) return cached;
-  const key = PRIMARY_ID_CACHE.get(entity);
-  if (key) return key;
-  return cacheWrap(`primaryid:${entity}`, 60_000, async () => {
+  return cacheWrap<string | undefined>(`primaryid:${entity}`, CACHE_TTL_MS_LONG, async () => {
     try {
       const meta = await getEntityMetadata(entity);
       const pid = meta?.PrimaryIdAttribute;
-      if (typeof pid === "string" && pid) {
-        PRIMARY_ID_CACHE.set(entity, pid);
-        return pid;
-      }
+      if (typeof pid === "string" && pid) return pid;
     } catch {
       /* métadonnées indisponibles : la création échouera avec un message clair */
     }

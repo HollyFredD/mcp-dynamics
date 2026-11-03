@@ -143,8 +143,6 @@ export const DELETE_DENYLIST = [
     "usersettings",
     "sn_specialistforecasts",
 ];
-/** Sous-chaînes interdites dans un nom d'entité (traversée de chemin / métadonnées). */
-export const FORBIDDEN_ENTITY_SUBSTRINGS = ["..", "/", "\\", "?"];
 // ---------------------------------------------------------------------------
 // Trimestres
 // ---------------------------------------------------------------------------
@@ -170,6 +168,10 @@ export const HARD_PAGE_CAP = 5000;
 export const DEFAULT_MAX_PAGES = 10;
 /** TTL (ms) du cache mémoire court sur les métadonnées. */
 export const CACHE_TTL_MS = 60_000;
+/** TTL long : métadonnées quasi immuables (clé primaire d'entité). */
+export const CACHE_TTL_MS_LONG = 10 * 60_000;
+/** Nombre max d'entrées du cache mémoire (LRU). */
+export const CACHE_MAX_ENTRIES = Number(process.env.MCP_DYNAMICS_CACHE_MAX ?? 1_000);
 /** Marge de sécurité avant expiration du token Azure. */
 export const TOKEN_EXPIRY_MARGIN_MS = 60_000;
 /** Timeout axios : lecture standard / écritures (plugins Dataverse lents). */

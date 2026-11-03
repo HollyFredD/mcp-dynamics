@@ -48,6 +48,19 @@ const { recordTools } = await import("./tools/records.js");
 const PORT = Number(process.env.MCP_DYNAMICS_HTTP_PORT ?? 3000);
 const HOST = process.env.MCP_DYNAMICS_HTTP_HOST ?? "127.0.0.1";
 const HTTP_TOKEN = process.env.MCP_DYNAMICS_HTTP_TOKEN ?? "";
+/** Plafond de sessions simultanées (borne la mémoire du daemon). */
+const MAX_SESSIONS = Number(process.env.MCP_DYNAMICS_MAX_SESSIONS ?? 100);
+/** Durée d'inactivité après laquelle une session est fermée (ms, défaut 30 min). */
+const SESSION_IDLE_MS = Number(process.env.MCP_DYNAMICS_SESSION_IDLE_MS ?? 30 * 60_000);
+/**
+ * Origines navigateur autorisées. Vide (défaut) = tout `Origin` est refusé :
+ * un serveur MCP local n'est pas censé être appelé depuis une page web, et
+ * l'absence de contrôle facilite le DNS-rebinding vers 127.0.0.1.
+ */
+const ALLOWED_ORIGINS = (process.env.MCP_DYNAMICS_ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 if (!HTTP_TOKEN) {
   logJson({
@@ -74,8 +87,37 @@ if (!HTTP_READONLY) {
   });
 }
 
-/** Sessions MCP en cours, indexées par sessionId. */
-const sessions = new Map<string, StreamableHTTPServerTransport>();
+/** Sessions MCP en cours, indexées par sessionId, avec horodatage d'activité. */
+interface Session {
+  transport: StreamableHTTPServerTransport;
+  lastSeen: number;
+}
+const sessions = new Map<string, Session>();
+
+/** Ferme les sessions inactives ; renvoie le nombre fermé. */
+function sweepIdleSessions(): number {
+  const now = Date.now();
+  let closed = 0;
+  for (const [id, session] of sessions) {
+    if (now - session.lastSeen > SESSION_IDLE_MS) {
+      sessions.delete(id);
+      closed += 1;
+      void session.transport.close().catch(() => undefined);
+    }
+  }
+  return closed;
+}
+
+// Purge périodique des sessions inactives (`unref` : ne bloque pas la sortie).
+const sessionTimer = setInterval(sweepIdleSessions, Math.max(60_000, SESSION_IDLE_MS / 2));
+if (typeof sessionTimer.unref === "function") sessionTimer.unref();
+
+/** Marque une session comme active (appelée à chaque requête dessus). */
+function touch(id: string): Session | undefined {
+  const session = sessions.get(id);
+  if (session) session.lastSeen = Date.now();
+  return session;
+}
 
 // ---------------------------------------------------------------------------
 // Middleware
@@ -116,6 +158,21 @@ const limiter = rateLimit({
   message: { error: "rate_limited" },
 });
 
+/**
+ * Refuse les requêtes portant un en-tête `Origin` non autorisé. Les clients MCP
+ * (CLI, SDK) n'envoient pas d'`Origin` ; seule une page web le fait, et c'est
+ * exactement le vecteur DNS-rebinding vers 127.0.0.1.
+ */
+function checkOrigin(req: Request, res: Response, next: () => void): void {
+  const origin = req.get("origin");
+  if (origin && !ALLOWED_ORIGINS.includes(origin)) {
+    res.status(403).json({ error: "forbidden_origin" });
+    logJson({ event: "origin_denied", origin, path: req.path });
+    return;
+  }
+  next();
+}
+
 // ---------------------------------------------------------------------------
 // Serveur
 // ---------------------------------------------------------------------------
@@ -123,6 +180,14 @@ const limiter = rateLimit({
 const app = express();
 
 app.get("/healthz", (_req, res) => {
+  // Réponse MINIMALE, non authentifiée : on n'expose ni l'URL d'instance, ni la
+  // liste d'entités autorisées, ni le mode read-only (détails réservés au
+  // endpoint authentifié ci-dessous).
+  res.json({ status: "ok" });
+});
+
+/** Diagnostic détaillé : derrière l'authentification. */
+app.get("/healthz/full", authenticate, (_req, res) => {
   res.json({
     status: "ok",
     tools: recordTools.length,
@@ -132,7 +197,7 @@ app.get("/healthz", (_req, res) => {
   });
 });
 
-app.use("/mcp", authenticate, limiter);
+app.use("/mcp", checkOrigin, authenticate, limiter);
 app.use(express.json({ limit: "4mb" }));
 
 /**
@@ -145,12 +210,20 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
     // Requête d'initialisation : ouvre une session.
     if (!sessionId && isInitializeRequest(req.body)) {
+      if (sessions.size >= MAX_SESSIONS) {
+        res.status(503).json({
+          error: `session_limit_reached: ${sessions.size} active sessions (max ${MAX_SESSIONS}). Close idle clients or raise MCP_DYNAMICS_MAX_SESSIONS.`,
+        });
+        logJson({ event: "session_limit", active: sessions.size });
+        return;
+      }
+
       const server = createMcpServer();
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (id: string) => {
-          sessions.set(id, transport);
-          logJson({ event: "session_opened", session_id: id });
+          sessions.set(id, { transport, lastSeen: Date.now() });
+          logJson({ event: "session_opened", session_id: id, active: sessions.size });
         },
       });
 
@@ -171,8 +244,8 @@ app.post("/mcp", async (req: Request, res: Response) => {
       return;
     }
 
-    const transport = sessions.get(sessionId);
-    if (!transport) {
+    const session = touch(sessionId);
+    if (!session) {
       res.status(404).json({
         error: "session_not_found: the session expired or was never opened. Re-initialize.",
       });
@@ -180,7 +253,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
       return;
     }
 
-    await transport.handleRequest(req, res, req.body);
+    await session.transport.handleRequest(req, res, req.body);
   } catch (err: unknown) {
     logJson({
       event: "request_error",
@@ -199,13 +272,13 @@ app.get("/mcp", async (req: Request, res: Response) => {
     res.status(400).json({ error: "bad_request: missing mcp-session-id" });
     return;
   }
-  const transport = sessions.get(sessionId);
-  if (!transport) {
+  const session = touch(sessionId);
+  if (!session) {
     res.status(404).json({ error: "session_not_found" });
     return;
   }
   try {
-    await transport.handleRequest(req, res);
+    await session.transport.handleRequest(req, res);
   } catch (err: unknown) {
     logJson({
       event: "sse_error",
@@ -222,12 +295,12 @@ app.delete("/mcp", async (req: Request, res: Response) => {
     res.status(400).json({ error: "bad_request: missing mcp-session-id" });
     return;
   }
-  const transport = sessions.get(sessionId);
-  if (!transport) {
+  const session = sessions.get(sessionId);
+  if (!session) {
     res.status(404).json({ error: "session_not_found" });
     return;
   }
-  await transport.handleRequest(req, res);
+  await session.transport.handleRequest(req, res);
   sessions.delete(sessionId);
 });
 

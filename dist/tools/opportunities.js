@@ -1,17 +1,11 @@
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import { queryRecords, queryAllFetchXml, createRecord, updateRecord, getRecord, deleteRecord, resolveUserGuid, assertEntityWritable, resolveCurrencyGuid, resolvePrimaryUnitId, } from "../dataverse.js";
+import { queryRecords, queryAll, queryAllFetchXml, createRecord, updateRecord, getRecord, deleteRecord, resolveUserGuid, assertEntityWritable, resolveCurrencyGuid, resolvePrimaryUnitId, } from "../dataverse.js";
 import { odataString } from "../odata.js";
-import { fetchXml, eqInt, eqStr, eqGuid, } from "../fetchxml.js";
+import { fetchXml, eqInt, eqStr, eqGuid, filter as renderFilter, } from "../fetchxml.js";
 import { STATUS_CODES, STATUS_CHOICES, STATE_OPEN, FORECAST_CODES, FORECAST_CHOICES, FORECAST_WRITABLE, COLLAB_NOTE_TYPES, COLLAB_NOTE_TYPE_CHOICES, DEFAULT_COLLAB_NOTE_TYPE, SUBJECT_MAX_LENGTH, DEFAULT_CURRENCY, SUPPORTED_CURRENCIES, ROLE_CHOICES, ROLE_FIELDS, CLOSE_PROBABILITY_FIELD, SN_PROBABILITY_FIELD, } from "../constants.js";
 import { bool, intIn, isoDate, oneOf, requiredStr, str, amount, } from "../validate.js";
 import { quarterOfDate } from "../dates.js";
-import { buildDiff, logMutation, maybeQuarter, resolveOpportunityId, verifyWrite, } from "./common.js";
-const DRY_RUN_PROP = {
-    dry_run: {
-        type: "boolean",
-        description: "When true (DEFAULT) nothing is written: the tool returns the exact diff it WOULD apply. Set false to actually write.",
-    },
-};
+import { DRY_RUN_PROP, buildDiff, decorateProbability, logMutation, maybeQuarter, probabilityToNumber, resolveOpportunityId, verifyWrite, } from "./common.js";
 const IDENTIFIER_PROPS = {
     opportunity_id: {
         type: "string",
@@ -44,16 +38,8 @@ const OPC_SELECT = [
     CLOSE_PROBABILITY_FIELD,
     SN_PROBABILITY_FIELD,
 ];
-/** Extrait sn_probability (string "100%") en nombre, quand c'est possible. */
-export function probabilityToNumber(v) {
-    if (typeof v === "number" && Number.isFinite(v))
-        return v;
-    if (typeof v === "string") {
-        const n = Number(v.replace("%", "").trim());
-        return Number.isFinite(n) ? n : undefined;
-    }
-    return undefined;
-}
+/** Extrait sn_probability (string "100%") en nombre — implémenté dans common.ts. */
+export { probabilityToNumber };
 // ===========================================================================
 // get_my_opportunities
 // ===========================================================================
@@ -124,7 +110,7 @@ async function handleGetMyOpportunities(args) {
         count: true,
     };
     const res = fetchAll
-        ? await queryAllFetchXmlEntity(base, top)
+        ? await queryAllEntity(base, top)
         : await queryRecords({ ...base, top });
     const rows = res.value.map(decorateOpportunity);
     const total = res["@odata.count"];
@@ -144,22 +130,13 @@ async function handleGetMyOpportunities(args) {
         opportunities: rows,
     };
 }
-/** queryAllFetchXml n'a pas de FetchXML ici : on délègue à queryAll. */
-async function queryAllFetchXmlEntity(base, top) {
-    const { queryAll } = await import("../dataverse.js");
+/** `queryAll` attend des options OData (pas de FetchXML) : simple adaptateur. */
+function queryAllEntity(base, top) {
     return queryAll({ ...base, page_size: top, max_pages: 10, count: true });
 }
 function decorateOpportunity(row) {
-    const out = { ...row };
-    // sn_probability est CALCULÉ et de type string : on le rend explicite et on
-    // expose la vraie probabilité numérique à côté.
-    const display = row[SN_PROBABILITY_FIELD];
-    if (display !== undefined) {
-        out.sn_probability_display = display;
-        delete out[SN_PROBABILITY_FIELD];
-    }
-    out.close_probability = row[CLOSE_PROBABILITY_FIELD] ?? probabilityToNumber(display) ?? null;
-    return out;
+    // sn_probability est CALCULÉ et de type string : décoré par common.ts.
+    return decorateProbability(row);
 }
 // ===========================================================================
 // search_opportunities
@@ -193,20 +170,25 @@ async function handleSearchOpportunities(args) {
     const status = oneOf(args.status, STATUS_CHOICES, "status", "open");
     const quarter = maybeQuarter(args.close_quarter);
     const top = intIn(args.top, "top", { def: 15, min: 1, max: 200 });
-    const conditions = [
-        {
-            attribute: "name",
-            operator: "like",
-            value: `%${query}%`,
-        },
-    ];
+    const baseConditions = [];
     if (status && status !== "all") {
-        conditions.unshift(eqInt("statecode", STATUS_CODES[status]));
+        baseConditions.push(eqInt("statecode", STATUS_CODES[status]));
     }
     if (quarter)
-        conditions.push(eqStr("sn_closequarter", quarter));
-    // H16 : une seule requête, donc une seule sémantique de recherche, et aucune
-    // fusion « avant troncature ».
+        baseConditions.push(eqStr("sn_closequarter", quarter));
+    /**
+     * H16 : la description promet « nom d'opportunité OR nom de compte ». Le
+     * filtre précédent mettait les deux branches en AND (filtre d'entité + filtre
+     * du link-entity inner), donc un deal trouvé par son compte seul était
+     * invisible. Le OR porte maintenant sur les deux attributs via `entityname`.
+     */
+    const nameOrAccount = renderFilter({
+        type: "or",
+        conditions: [
+            { attribute: "name", operator: "like", value: query },
+            { attribute: "name", operator: "like", value: query, entityalias: "acc" },
+        ],
+    });
     const build = (fetchTop) => fetchXml({
         top: fetchTop,
         entity: {
@@ -224,16 +206,17 @@ async function handleSearchOpportunities(args) {
                 CLOSE_PROBABILITY_FIELD,
                 SN_PROBABILITY_FIELD,
             ],
-            filter: { type: "and", conditions },
+            filter: { type: "and", conditions: baseConditions, filters: [nameOrAccount] },
             links: [
                 {
                     name: "account",
                     from: "accountid",
                     to: "customerid",
                     alias: "acc",
-                    linkType: "inner",
+                    // left-outer : une opportunité sans compte correspondant doit
+                    // rester trouvable par son propre nom.
+                    linkType: "left-outer",
                     attributes: [{ name: "name", alias: "account_name" }],
-                    filter: { type: "and", conditions: [{ attribute: "name", operator: "like", value: `%${query}%` }] },
                 },
             ],
             order: [{ attribute: "estimatedclosedate", descending: false }],
@@ -401,7 +384,6 @@ async function handleAddCollaborationNote(args) {
     if (!subject) {
         throw new McpError(ErrorCode.InvalidParams, "The collaboration note would have an empty subject. Provide a non-empty 'note' or an explicit 'subject'.");
     }
-    assertEntityWritable("sn_activitycustomnoteses");
     const data = {
         subject,
         sn_activitycustomnotes: note,
@@ -790,13 +772,15 @@ async function handleUpdateOpportunityForecast(args) {
             next_step: "Call again with dry_run=false to apply this diff.",
         };
     }
-    await updateRecord("opportunities", opp.id, data, Object.keys(data));
+    // `updateRecord` relit déjà les champs demandés (rereadFields) : on réutilise
+    // cette lecture au lieu d'un second GET identique.
+    const reread = await updateRecord("opportunities", opp.id, data, Object.keys(data));
     logMutation("update_opportunity_forecast", {
         opportunity: opp.number ?? opp.id,
         fields: data,
         diff: buildDiff(before, data),
     });
-    const after = await getRecord("opportunities", opp.id, Object.keys(data));
+    const after = reread ?? (await getRecord("opportunities", opp.id, Object.keys(data)));
     const check = verifyWrite(after, data);
     return {
         dry_run: false,

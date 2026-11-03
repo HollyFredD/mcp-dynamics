@@ -11,7 +11,7 @@ import { crudTools, crudHandlers, type ToolDef, type ToolHandler } from "./crud.
 import { opportunityTools, opportunityHandlers } from "./opportunities.js";
 import { forecastTools, forecastHandlers } from "./forecast.js";
 import { metaTools, metaHandlers } from "./meta.js";
-import { toolResult, isMcpError, shortError } from "./common.js";
+import { toolResult, isMcpError, shortError, countRows } from "./common.js";
 
 /** Les 18 outils historiques, plus les 8 nouveaux. */
 export const recordTools: ToolDef[] = [
@@ -31,32 +31,6 @@ const handlers: Record<string, ToolHandler> = {
 /** Noms des outils, utile pour la doc et les diagnostics. */
 export function toolNames(): string[] {
   return recordTools.map((t) => t.name);
-}
-
-function countRows(result: unknown): number | undefined {
-  if (result && typeof result === "object") {
-    const r = result as Record<string, unknown>;
-    for (const key of [
-      "records",
-      "value",
-      "opportunities",
-      "notes",
-      "product_lines",
-      "fields",
-      "groups",
-      "entities",
-      "values",
-      "specialist_forecasts",
-      "calls",
-      "at_risk",
-    ]) {
-      const v = r[key];
-      if (Array.isArray(v)) return v.length;
-    }
-    if (typeof r.row_count === "number") return r.row_count;
-    if (typeof r.line_count === "number") return r.line_count;
-  }
-  return undefined;
 }
 
 /**

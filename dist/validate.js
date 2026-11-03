@@ -11,7 +11,6 @@
  * puisse se corriger sans aller-retour.
  */
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import { FORBIDDEN_ENTITY_SUBSTRINGS } from "./constants.js";
 import { assertEntityName, guid as validateGuid } from "./odata.js";
 function fail(message) {
     throw new McpError(ErrorCode.InvalidParams, message);
@@ -167,16 +166,9 @@ export function record(v, field = "data") {
 export function guidParam(v, field = "id") {
     return validateGuid(String(v ?? ""), field);
 }
-/** Valide un nom d'entité (anti-traversée). */
+/** Valide un nom d'entité (délègue à odata.ts, qui rejette déjà la traversée). */
 export function entityName(v, field = "entity") {
-    const s = assertEntityName(v, field);
-    const low = s.toLowerCase();
-    for (const bad of FORBIDDEN_ENTITY_SUBSTRINGS) {
-        if (low.includes(bad)) {
-            return fail(`Invalid '${field}': '${s}' contains the forbidden sequence '${bad}'.`);
-        }
-    }
-    return s;
+    return assertEntityName(v, field);
 }
 /** Normalise un tableau d'entités et renvoie la liste canonique. */
 export function entityNameList(v, field = "entity") {

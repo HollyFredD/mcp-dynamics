@@ -20,6 +20,11 @@ Environment=MCP_DYNAMICS_HTTP_HOST=127.0.0.1
 Environment=MCP_DYNAMICS_HTTP_PORT=3000
 Environment=MCP_DYNAMICS_READONLY=1
 Environment=DYNAMICS_INSTANCE_URL=https://servicenow.crm.dynamics.com
+# Bornes du daemon (optionnel, valeurs par défaut indiquées) :
+# Environment=MCP_DYNAMICS_MAX_SESSIONS=100
+# Environment=MCP_DYNAMICS_SESSION_IDLE_MS=1800000
+# Origines navigateur autorisées (vide = aucune, recommandé pour un serveur local) :
+# Environment=MCP_DYNAMICS_ALLOWED_ORIGINS=
 
 # ⚠️ Le token DOIT sortir de ce fichier : lis-le d'un fichier root-only.
 #   mkdir -p /etc/mcp-dynamics && openssl rand -hex 32 > /etc/mcp-dynamics/token

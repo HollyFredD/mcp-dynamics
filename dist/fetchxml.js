@@ -10,29 +10,31 @@ import { fetchxmlValue, odataString } from "./odata.js";
 // ---------------------------------------------------------------------------
 // Briques de base
 // ---------------------------------------------------------------------------
-function attrName(spec) {
-    return spec.entityalias ? `${spec.entityalias}.${spec.attribute}` : spec.attribute;
+/** Attribut `entityname="…"` quand la condition porte sur une entité liée. */
+function entityNameAttr(spec) {
+    return spec.entityalias ? ` entityname="${fetchxmlValue(spec.entityalias)}"` : "";
 }
 /** Rend un `<condition …/>`. Toutes les valeurs sont échappées. */
 export function condition(spec) {
-    const attr = attrName(spec);
+    const attr = spec.attribute;
+    const owner = entityNameAttr(spec);
     const op = spec.operator ?? "eq";
     if (op === "null" || op === "not-null") {
-        return `<condition attribute="${fetchxmlValue(attr)}" operator="${op}" />`;
+        return `<condition${owner} attribute="${fetchxmlValue(attr)}" operator="${op}" />`;
     }
     if (op === "in" || op === "not-in") {
         const vals = Array.isArray(spec.value) ? spec.value : [spec.value ?? ""];
         if (!vals.length) {
             // Un `in ()` est du FetchXML invalide : on rend un filtre impossible.
-            return `<condition attribute="${fetchxmlValue(attr)}" operator="${op}"><value xsi:nil="true" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" /></condition>`;
+            return `<condition${owner} attribute="${fetchxmlValue(attr)}" operator="${op}"><value xsi:nil="true" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" /></condition>`;
         }
         const inner = vals.map((v) => `<value>${fetchxmlValue(v)}</value>`).join("");
-        return `<condition attribute="${fetchxmlValue(attr)}" operator="${op}">${inner}</condition>`;
+        return `<condition${owner} attribute="${fetchxmlValue(attr)}" operator="${op}">${inner}</condition>`;
     }
     if (op === "like" || op === "not-like") {
-        return `<condition attribute="${fetchxmlValue(attr)}" operator="${op}" value="${fetchxmlValue(`%${String(spec.value ?? "")}%`)}" />`;
+        return `<condition${owner} attribute="${fetchxmlValue(attr)}" operator="${op}" value="${fetchxmlValue(`%${String(spec.value ?? "")}%`)}" />`;
     }
-    return `<condition attribute="${fetchxmlValue(attr)}" operator="${op}" value="${fetchxmlValue(spec.value)}" />`;
+    return `<condition${owner} attribute="${fetchxmlValue(attr)}" operator="${op}" value="${fetchxmlValue(spec.value)}" />`;
 }
 /** Rend un `<filter>` à partir de conditions et/ou de sous-filtres déjà rendus. */
 export function filter(spec) {
@@ -40,12 +42,11 @@ export function filter(spec) {
         return undefined;
     if (Array.isArray(spec))
         return renderFilter("and", [], spec);
-    const children = [...(spec.conditions ?? []).map(condition)];
-    if (spec.filters?.length)
-        children.push(...spec.filters.filter(Boolean));
-    if (!children.length)
+    const raw = (spec.filters ?? []).filter(Boolean);
+    const conditions = spec.conditions ?? [];
+    if (!conditions.length && !raw.length)
         return undefined;
-    return renderFilter(spec.type ?? "and", [], children);
+    return renderFilter(spec.type ?? "and", conditions, raw);
 }
 function renderFilter(type, conditions, raw) {
     const parts = [...conditions.map(condition), ...raw.filter(Boolean)];
@@ -219,5 +220,78 @@ export function odataEqStr(attribute, value) {
 /** Filtre OData `eq` sur un entier. */
 export function odataEqInt(attribute, value) {
     return `${attribute} eq ${Math.trunc(value)}`;
+}
+// ---------------------------------------------------------------------------
+// Pagination
+// ---------------------------------------------------------------------------
+/**
+ * Force (ou ajoute) `top="N"` sur l'élément racine `<fetch>`.
+ *
+ * L'ancienne implémentation faisait `xml.replace(/top="\d+"/, …)` : quand le
+ * FetchXML fourni par l'appelant n'avait pas d'attribut `top`, le remplacement
+ * était un no-op et la MÊME requête repartait à chaque page — les lignes
+ * revenaient en doublon.
+ */
+export function withTop(xml, top) {
+    const value = String(Math.max(1, Math.trunc(top)));
+    if (/top="\d+"/.test(xml))
+        return xml.replace(/top="\d+"/, `top="${value}"`);
+    return xml.replace(/<fetch(\s[^>]*)?>/, (open) => open.replace(/^<fetch/, `<fetch top="${value}"`));
+}
+/**
+ * Injecte les attributs de pagination serveur (`page`, `count`, `pagingcookie`)
+ * et retire `top`, qui est incompatible avec le paging par page.
+ */
+export function withPaging(xml, page, count, cookie) {
+    const cleaned = xml
+        .replace(/\s(?:page|count|pagingcookie)="[^"]*"/g, "")
+        .replace(/\stop="\d+"/g, "");
+    const attrs = [
+        `page="${Math.max(1, Math.trunc(page))}"`,
+        `count="${Math.max(1, Math.trunc(count))}"`,
+        cookie ? `pagingcookie="${fetchxmlValue(cookie)}"` : "",
+    ]
+        .filter(Boolean)
+        .join(" ");
+    return cleaned.replace(/<fetch(\s[^>]*)?>/, (open) => {
+        const base = open.replace(/\s*>$/, "").replace(/\/$/, "");
+        return `${base} ${attrs}>`;
+    });
+}
+/**
+ * Source unique de la requête utilisée par `get_forecast_summary` et
+ * `get_forecast_integrity` (elles étaient dupliquées à 90 %).
+ */
+export function specialistRowsQuery(o) {
+    return (top) => fetchXml({
+        top,
+        entity: {
+            name: "sn_specialistforecast",
+            attributes: o.attributes,
+            filter: {
+                type: "and",
+                conditions: [eqGuid("ownerid", o.ownerGuid), eqInt("statecode", 0)],
+            },
+            links: [
+                businessUnitLink(o.businessUnits),
+                {
+                    name: "opportunity",
+                    from: "opportunityid",
+                    to: "sn_opportunity",
+                    alias: "opp",
+                    linkType: "inner",
+                    attributes: o.opportunityAttributes,
+                    filter: {
+                        type: "and",
+                        conditions: [
+                            eqStr("sn_closequarter", o.quarter),
+                            eqInt("statecode", 0),
+                            ...(o.extraOpportunityConditions ?? []),
+                        ],
+                    },
+                },
+            ],
+        },
+    });
 }
 //# sourceMappingURL=fetchxml.js.map

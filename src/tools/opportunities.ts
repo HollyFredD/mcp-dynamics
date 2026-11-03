@@ -1,6 +1,7 @@
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import {
   queryRecords,
+  queryAll,
   queryAllFetchXml,
   createRecord,
   updateRecord,
@@ -17,6 +18,7 @@ import {
   eqInt,
   eqStr,
   eqGuid,
+  filter as renderFilter,
   type ConditionSpec,
   type FilterSpec,
 } from "../fetchxml.js";
@@ -49,21 +51,16 @@ import {
 } from "../validate.js";
 import { quarterOfDate } from "../dates.js";
 import {
+  DRY_RUN_PROP,
   buildDiff,
+  decorateProbability,
   logMutation,
   maybeQuarter,
+  probabilityToNumber,
   resolveOpportunityId,
   verifyWrite,
 } from "./common.js";
 import type { ToolDef, ToolHandler } from "./crud.js";
-
-const DRY_RUN_PROP = {
-  dry_run: {
-    type: "boolean",
-    description:
-      "When true (DEFAULT) nothing is written: the tool returns the exact diff it WOULD apply. Set false to actually write.",
-  },
-} as const;
 
 const IDENTIFIER_PROPS = {
   opportunity_id: {
@@ -99,15 +96,8 @@ const OPC_SELECT = [
   SN_PROBABILITY_FIELD,
 ] as const;
 
-/** Extrait sn_probability (string "100%") en nombre, quand c'est possible. */
-export function probabilityToNumber(v: unknown): number | undefined {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v === "string") {
-    const n = Number(v.replace("%", "").trim());
-    return Number.isFinite(n) ? n : undefined;
-  }
-  return undefined;
-}
+/** Extrait sn_probability (string "100%") en nombre — implémenté dans common.ts. */
+export { probabilityToNumber };
 
 // ===========================================================================
 // get_my_opportunities
@@ -187,7 +177,7 @@ async function handleGetMyOpportunities(args: Record<string, unknown>): Promise<
   };
 
   const res = fetchAll
-    ? await queryAllFetchXmlEntity(base, top)
+    ? await queryAllEntity(base, top)
     : await queryRecords({ ...base, top });
 
   const rows = res.value.map(decorateOpportunity);
@@ -210,26 +200,17 @@ async function handleGetMyOpportunities(args: Record<string, unknown>): Promise<
   };
 }
 
-/** queryAllFetchXml n'a pas de FetchXML ici : on délègue à queryAll. */
-async function queryAllFetchXmlEntity(
+/** `queryAll` attend des options OData (pas de FetchXML) : simple adaptateur. */
+function queryAllEntity(
   base: { entity: string; filter: string; select: string[]; orderby: string },
   top: number
 ) {
-  const { queryAll } = await import("../dataverse.js");
   return queryAll({ ...base, page_size: top, max_pages: 10, count: true });
 }
 
 function decorateOpportunity(row: Record<string, unknown>): Record<string, unknown> {
-  const out = { ...row };
-  // sn_probability est CALCULÉ et de type string : on le rend explicite et on
-  // expose la vraie probabilité numérique à côté.
-  const display = row[SN_PROBABILITY_FIELD];
-  if (display !== undefined) {
-    out.sn_probability_display = display;
-    delete out[SN_PROBABILITY_FIELD];
-  }
-  out.close_probability = row[CLOSE_PROBABILITY_FIELD] ?? probabilityToNumber(display) ?? null;
-  return out;
+  // sn_probability est CALCULÉ et de type string : décoré par common.ts.
+  return decorateProbability(row);
 }
 
 // ===========================================================================
@@ -267,20 +248,26 @@ async function handleSearchOpportunities(args: Record<string, unknown>): Promise
   const quarter = maybeQuarter(args.close_quarter);
   const top = intIn(args.top, "top", { def: 15, min: 1, max: 200 });
 
-  const conditions: ConditionSpec[] = [
-    {
-      attribute: "name",
-      operator: "like",
-      value: `%${query}%`,
-    },
-  ];
+  const baseConditions: ConditionSpec[] = [];
   if (status && status !== "all") {
-    conditions.unshift(eqInt("statecode", STATUS_CODES[status as keyof typeof STATUS_CODES]));
+    baseConditions.push(eqInt("statecode", STATUS_CODES[status as keyof typeof STATUS_CODES]));
   }
-  if (quarter) conditions.push(eqStr("sn_closequarter", quarter));
+  if (quarter) baseConditions.push(eqStr("sn_closequarter", quarter));
 
-  // H16 : une seule requête, donc une seule sémantique de recherche, et aucune
-  // fusion « avant troncature ».
+  /**
+   * H16 : la description promet « nom d'opportunité OR nom de compte ». Le
+   * filtre précédent mettait les deux branches en AND (filtre d'entité + filtre
+   * du link-entity inner), donc un deal trouvé par son compte seul était
+   * invisible. Le OR porte maintenant sur les deux attributs via `entityname`.
+   */
+  const nameOrAccount = renderFilter({
+    type: "or",
+    conditions: [
+      { attribute: "name", operator: "like", value: query },
+      { attribute: "name", operator: "like", value: query, entityalias: "acc" },
+    ],
+  })!;
+
   const build = (fetchTop: number) =>
     fetchXml({
       top: fetchTop,
@@ -299,16 +286,17 @@ async function handleSearchOpportunities(args: Record<string, unknown>): Promise
           CLOSE_PROBABILITY_FIELD,
           SN_PROBABILITY_FIELD,
         ],
-        filter: { type: "and", conditions },
+        filter: { type: "and", conditions: baseConditions, filters: [nameOrAccount] },
         links: [
           {
             name: "account",
             from: "accountid",
             to: "customerid",
             alias: "acc",
-            linkType: "inner",
+            // left-outer : une opportunité sans compte correspondant doit
+            // rester trouvable par son propre nom.
+            linkType: "left-outer",
             attributes: [{ name: "name", alias: "account_name" }],
-            filter: { type: "and", conditions: [{ attribute: "name", operator: "like", value: `%${query}%` }] },
           },
         ],
         order: [{ attribute: "estimatedclosedate", descending: false }],
@@ -509,8 +497,6 @@ async function handleAddCollaborationNote(args: Record<string, unknown>): Promis
       "The collaboration note would have an empty subject. Provide a non-empty 'note' or an explicit 'subject'."
     );
   }
-
-  assertEntityWritable("sn_activitycustomnoteses");
 
   const data: Record<string, unknown> = {
     subject,
@@ -996,14 +982,16 @@ async function handleUpdateOpportunityForecast(args: Record<string, unknown>): P
     };
   }
 
-  await updateRecord("opportunities", opp.id, data, Object.keys(data));
+  // `updateRecord` relit déjà les champs demandés (rereadFields) : on réutilise
+  // cette lecture au lieu d'un second GET identique.
+  const reread = await updateRecord("opportunities", opp.id, data, Object.keys(data));
   logMutation("update_opportunity_forecast", {
     opportunity: opp.number ?? opp.id,
     fields: data,
     diff: buildDiff(before, data),
   });
 
-  const after = await getRecord("opportunities", opp.id, Object.keys(data));
+  const after = reread ?? (await getRecord("opportunities", opp.id, Object.keys(data)));
   const check = verifyWrite(after, data);
 
   return {

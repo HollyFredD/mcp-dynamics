@@ -1,21 +1,14 @@
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { queryRecords, queryAllFetchXml, updateRecord, getRecord, resolveUserGuid, assertEntityWritable, } from "../dataverse.js";
 import { odataString } from "../odata.js";
-import { fetchXml, eqInt, eqStr, eqGuid, filter as renderFilter, businessUnitLink, specialistForecastQuery, aggAttribute, groupByAttribute, } from "../fetchxml.js";
-import { FORECAST_CODES, FORECAST_WRITABLE, CATEGORY_LABELS, AT_RISK, STATE_OPEN, ROLE_FIELDS_FETCHXML, CLOSE_PROBABILITY_FIELD, SN_PROBABILITY_FIELD, } from "../constants.js";
+import { fetchXml, eqInt, eqStr, eqGuid, filter as renderFilter, businessUnitLink, specialistForecastQuery, specialistRowsQuery, aggAttribute, groupByAttribute, } from "../fetchxml.js";
+import { FORECAST_CODES, FORECAST_WRITABLE, CATEGORY_LABELS, AT_RISK, STATE_OPEN, STATUS_CODES, ROLE_FIELDS_FETCHXML, CLOSE_PROBABILITY_FIELD, SN_PROBABILITY_FIELD, } from "../constants.js";
 import { CLOSURE_BLOCKERS, BLOCKER_LABELS, CHECKLIST_GROUPS, allChecklistFields } from "../checklist.js";
 import { bool, intIn, oneOf, str, strArray } from "../validate.js";
 import { civilDate, civilDateAddDays, quarterContext } from "../dates.js";
-import { buildDiff, logMutation, maybeQuarter, requireQuarter, resolveOpportunityId, verifyWrite, } from "./common.js";
-import { probabilityToNumber } from "./opportunities.js";
+import { DRY_RUN_PROP, buildDiff, categoryLabel, decorateProbability, logMutation, maybeQuarter, probabilityToNumber, requireQuarter, resolveOpportunityId, verifyWrite, } from "./common.js";
 /** Entités que ce module a le droit d'écrire via un outil métier dédié. */
 const SANCTIONED_SF_WRITES = ["sn_specialistforecasts"];
-const DRY_RUN_PROP = {
-    dry_run: {
-        type: "boolean",
-        description: "When true (DEFAULT) nothing is written: the tool returns the exact diff it WOULD apply. Set false to actually write.",
-    },
-};
 // ===========================================================================
 // get_specialist_opportunities
 // ===========================================================================
@@ -42,7 +35,7 @@ const getSpecialistOpportunitiesTool = {
         },
     },
 };
-const STATUS_CODE_BY_NAME = { open: 0, won: 1, lost: 2 };
+const STATUS_CODE_BY_NAME = { ...STATUS_CODES };
 async function handleGetSpecialistOpportunities(args) {
     const email = str(args.email, "email", { max: 200 });
     const businessUnits = strArray(args.business_units, "business_units", { max: 100, maxItems: 25 });
@@ -95,20 +88,14 @@ async function handleGetSpecialistOpportunities(args) {
     };
 }
 function decorateSpecialist(row) {
-    const out = { ...row };
-    const display = row[SN_PROBABILITY_FIELD];
-    if (display !== undefined) {
-        out.sn_probability_display = display;
-        delete out[SN_PROBABILITY_FIELD];
-    }
-    out.close_probability = probabilityToNumber(display) ?? null;
+    const out = decorateProbability(row);
     const oppCat = row["opp.sn_forecastcategory"];
     if (typeof oppCat === "number") {
-        out.opportunity_forecast_category = CATEGORY_LABELS[oppCat] ?? `unknown_${oppCat}`;
+        out.opportunity_forecast_category = categoryLabel(oppCat);
     }
     const cat = row.sn_specialistforecastcategory;
     if (typeof cat === "number") {
-        out.specialist_forecast_category = CATEGORY_LABELS[cat] ?? `unknown_${cat}`;
+        out.specialist_forecast_category = categoryLabel(cat);
     }
     out.specialist_nnacv = row.sn_productnnacv ?? 0;
     return out;
@@ -141,37 +128,18 @@ async function handleGetForecastSummary(args) {
     const email = str(args.email, "email", { max: 200 });
     const businessUnits = strArray(args.business_units, "business_units", { max: 100, maxItems: 25 });
     const userGuid = await resolveUserGuid(email);
-    const build = (top) => fetchXml({
-        top,
-        entity: {
-            name: "sn_specialistforecast",
-            attributes: [
-                "sn_specialistforecastid",
-                "sn_specialistforecastcategory",
-                "sn_specialistforecastcategoryreporting",
-                "sn_productnnacv",
-                "sn_specialistnnacvreporting",
-            ],
-            filter: {
-                type: "and",
-                conditions: [eqGuid("ownerid", userGuid), eqInt("statecode", STATE_OPEN)],
-            },
-            links: [
-                businessUnitLink(businessUnits),
-                {
-                    name: "opportunity",
-                    from: "opportunityid",
-                    to: "sn_opportunity",
-                    alias: "opp",
-                    linkType: "inner",
-                    attributes: ["name", "sn_number", "sn_closequarter", "estimatedclosedate", "sn_salesstage"],
-                    filter: {
-                        type: "and",
-                        conditions: [eqStr("sn_closequarter", quarter), eqInt("statecode", STATE_OPEN)],
-                    },
-                },
-            ],
-        },
+    const build = specialistRowsQuery({
+        ownerGuid: userGuid,
+        quarter,
+        businessUnits,
+        attributes: [
+            "sn_specialistforecastid",
+            "sn_specialistforecastcategory",
+            "sn_specialistforecastcategoryreporting",
+            "sn_productnnacv",
+            "sn_specialistnnacvreporting",
+        ],
+        opportunityAttributes: ["name", "sn_number", "sn_closequarter", "estimatedclosedate", "sn_salesstage"],
     });
     const res = await queryAllFetchXml({
         entity: "sn_specialistforecasts",
@@ -324,10 +292,12 @@ async function handleUpdateSpecialistForecast(args) {
     if (candidates.length > 1 && confirm !== true) {
         throw new McpError(ErrorCode.InvalidParams, `Ambiguous: ${candidates.length} specialist forecast records match opportunity ${opp.number ?? opp.id} (business units: ${bus.join(", ")}). Re-call with business_unit='<one of these>' to target a single BU, or confirm=true to update all ${candidates.length} records.`);
     }
-    const before = await Promise.all(candidates.map((c) => getRecord("sn_specialistforecasts", String(c.sn_specialistforecastid), [
-        "sn_specialistforecastid",
-        "sn_specialistforecastcategory",
-    ])));
+    // Les lignes candidates portent déjà `sn_specialistforecastcategory` : on
+    // évite N GET supplémentaires (l'ancien code relisait chaque ligne).
+    const before = candidates.map((c) => ({
+        sn_specialistforecastid: c.sn_specialistforecastid,
+        sn_specialistforecastcategory: c.sn_specialistforecastcategory,
+    }));
     const diff = candidates.map((_c, i) => buildDiff(before[i], { sn_specialistforecastcategory: newCode })[0]);
     if (dryRun) {
         return {
@@ -506,16 +476,10 @@ function renderRoleOr(conditions) {
     return renderFilter({ type: "or", conditions }) ?? "";
 }
 function decorateOpportunityLight(row) {
-    const out = { ...row };
-    const display = row[SN_PROBABILITY_FIELD];
-    if (display !== undefined) {
-        out.sn_probability_display = display;
-        delete out[SN_PROBABILITY_FIELD];
-    }
-    out.close_probability = row[CLOSE_PROBABILITY_FIELD] ?? probabilityToNumber(display) ?? null;
+    const out = decorateProbability(row);
     const cat = row.sn_forecastcategory;
     if (typeof cat === "number")
-        out.forecast_category = CATEGORY_LABELS[cat] ?? `unknown_${cat}`;
+        out.forecast_category = categoryLabel(cat);
     return out;
 }
 // ===========================================================================
@@ -554,38 +518,19 @@ async function handleGetForecastIntegrity(args) {
     const includeMatching = bool(args.include_matching, "include_matching", false);
     const bus = businessUnits ?? (bu ? [bu] : undefined);
     const userGuid = await resolveUserGuid(email);
-    const build = (top) => fetchXml({
-        top,
-        entity: {
-            name: "sn_specialistforecast",
-            attributes: [
-                "sn_specialistforecastid",
-                "sn_specialistforecastcategory",
-                "sn_specialistforecastcategoryreporting",
-                "sn_productnnacv",
-                "sn_specialistnnacvreporting",
-                "sn_forecasttype",
-            ],
-            filter: {
-                type: "and",
-                conditions: [eqGuid("ownerid", userGuid), eqInt("statecode", STATE_OPEN)],
-            },
-            links: [
-                businessUnitLink(bus),
-                {
-                    name: "opportunity",
-                    from: "opportunityid",
-                    to: "sn_opportunity",
-                    alias: "opp",
-                    linkType: "inner",
-                    attributes: ["name", "sn_number", "sn_closequarter", "estimatedclosedate"],
-                    filter: {
-                        type: "and",
-                        conditions: [eqStr("sn_closequarter", quarter), eqInt("statecode", STATE_OPEN)],
-                    },
-                },
-            ],
-        },
+    const build = specialistRowsQuery({
+        ownerGuid: userGuid,
+        quarter,
+        businessUnits: bus,
+        attributes: [
+            "sn_specialistforecastid",
+            "sn_specialistforecastcategory",
+            "sn_specialistforecastcategoryreporting",
+            "sn_productnnacv",
+            "sn_specialistnnacvreporting",
+            "sn_forecasttype",
+        ],
+        opportunityAttributes: ["name", "sn_number", "sn_closequarter", "estimatedclosedate"],
     });
     const res = await queryAllFetchXml({
         entity: "sn_specialistforecasts",
@@ -915,33 +860,47 @@ async function handleGetTeamForecast(args) {
         ? Math.round(repList.reduce((s, r) => s + Math.pow((r.acv / totalAcv) * 100, 2), 0) * 100) / 100
         : 0;
     // Reps sans AUCUNE prévision : roster approximatif dérivé des specialists
-    // actifs sur ces BUs (hors trimestre courant).
-    const roster = await queryRecords({
-        entity: "sn_specialistforecasts",
-        fetchxml: fetchXml({
-            top: 1000,
-            entity: {
-                name: "sn_specialistforecast",
-                attributes: ["sn_specialistforecastid"],
-                filter: { type: "and", conditions: [eqInt("statecode", STATE_OPEN)] },
-                links: [
-                    { ...businessUnitLink(scopedBu), attributes: [] },
-                    {
-                        name: "systemuser",
-                        from: "ownerid",
-                        to: "systemuserid",
-                        alias: "rep",
-                        linkType: "inner",
-                        attributes: ["fullname"],
-                    },
-                ],
-            },
-        }),
-    }).catch(() => ({ value: [] }));
-    const rosterNames = new Set();
-    for (const r of roster.value) {
-        if (r["rep.fullname"])
-            rosterNames.add(String(r["rep.fullname"]));
+    // actifs sur ces BUs (hors trimestre courant). Pagination suivie pour ne pas
+    // tronquer à 1000 ; une erreur est SIGNALÉE et non avalée (l'ancien
+    // `.catch(() => ({value: []}))` affirmait « aucun rep sans forecast » à tort).
+    let rosterNames = new Set();
+    let rosterWarning;
+    try {
+        const roster = await queryAllFetchXml({
+            entity: "sn_specialistforecasts",
+            buildFetch: (top) => fetchXml({
+                top,
+                entity: {
+                    name: "sn_specialistforecast",
+                    attributes: ["sn_specialistforecastid"],
+                    filter: { type: "and", conditions: [eqInt("statecode", STATE_OPEN)] },
+                    links: [
+                        { ...businessUnitLink(scopedBu), attributes: [] },
+                        {
+                            name: "systemuser",
+                            from: "ownerid",
+                            to: "systemuserid",
+                            alias: "rep",
+                            linkType: "inner",
+                            attributes: ["fullname"],
+                        },
+                    ],
+                },
+            }),
+            page_size: 1000,
+            max_pages: 20,
+        });
+        for (const r of roster.value) {
+            if (r["rep.fullname"])
+                rosterNames.add(String(r["rep.fullname"]));
+        }
+        if (roster.truncated) {
+            rosterWarning =
+                "The rep roster was truncated: 'reps_without_forecast' may be incomplete. Restrict with 'bu'.";
+        }
+    }
+    catch (err) {
+        rosterWarning = `Could not build the rep roster (${err instanceof Error ? err.message : String(err)}). 'reps_without_forecast' is unavailable for this run.`;
     }
     const repsWithoutForecast = [...rosterNames].filter((n) => !reps.has(n)).sort();
     return {
@@ -974,6 +933,7 @@ async function handleGetTeamForecast(args) {
         },
         reps_without_forecast: repsWithoutForecast,
         reps_without_forecast_count: repsWithoutForecast.length,
+        roster_warning: rosterWarning,
         truncated: res.truncated,
     };
 }
